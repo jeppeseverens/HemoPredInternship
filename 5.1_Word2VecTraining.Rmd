@@ -1,0 +1,655 @@
+```{r}
+# Packages
+library(word2vec)
+library(stringr)
+library(parallel)
+library(foreach)
+library(ComplexHeatmap)
+library(uwot)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(ggthemes)
+library(dplyr)
+library(factoextra)
+```
+
+# Word2Vec implementation on sequences and secondary structure
+Here we are going to train our word2vec model, which in short takes a word as input
+with the task to predict which words occur around it. The weights used for this
+are unique per word and these weights can be used as a feature representing that word.
+
+This is intersting because you would expect words with the same meaning to appear
+among the same words and thus to have kinda the same weight/vector.
+
+Instead of text we will use peptide sequences and the secondary structure (ss) as a sequence. 
+With 1 or 2 grams made out of the sequence/ss as the "words".
+
+I have the porter5 dataset, which was used to train secondary structure prediction 
+model and contains sequences and their secondary structure. I also have our 
+hemolytic peptides with predicted secondary structure. Let's see if
+we can make representations out of them both.
+
+First we will convert sequences and secondary structures to a format that works 
+for the word2vec wrapper package. Then we will train our word2vec representation
+of sequences and structures. 
+
+## Porter5 information to "sentences" of sequence and structure
+From porter5 I have downloaded sequences and corresponding secondary structures. 
+These files consists of 5 lines per protein with
+1. Protein name
+2. ID
+3. Amino acid sequence
+4. Secondary structure
+5. Blank
+
+With the amino acid sequence and secondary structure like this:
+NKYFENV
+..S.TT.
+
+There are 8 states of secondary structures (H, E, B, T, S, L, G, and I) and of 
+course the no stucture state (the . in above sequence), which can be simplified 
+to 3 states: α-helix (H) and β-strand (E), and one irregular secondary structure 
+type, the coil region (C). 
+
+The most widely used convention is that helix is designated as G, H and I; sheet 
+as B and E; and all other states are designated as a coils. 
+Which we will do below.
+
+```{r}
+# Import Porter5 datasets
+Porter5 <- c(readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/Porter5_SS/test.set"),
+             readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/Porter5_SS/train.set"))
+
+# We only need 3. and 4. as information
+sequencePorter5 <- Porter5[c(FALSE, FALSE, TRUE, FALSE, FALSE)]
+structurePorter5 <- Porter5[c(FALSE, FALSE, FALSE, TRUE, FALSE)]
+
+# Remove unnatural amino acids, regex so I can remove information from both vectors
+AADict <- c("A", "R", "N", "D", "C", "E", "Q", "G", "H", 
+        "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+regex <- paste(c("[^", paste(AADict, collapse = "|"), "]"), collapse = "")
+# Which sequences do not have amino acids other than the above?
+keep <- !(grepl(regex, sequencePorter5))
+# We keep those
+sequencePorter5 <- sequencePorter5[keep]
+structurePorter5 <- structurePorter5[keep]
+
+cat("Before\n")
+structurePorter5[3]
+
+# Dont forget to store original info as meta data...
+sequencePorter5Original <- sequencePorter5
+structurePorter5Original <- structurePorter5
+
+# And we need to reduce 7 states plus no state (.) to 3 states
+# I use _helix etc, because this will be clearer later on when we make words out
+# of the amino acids and secondary stucture
+structurePorter5 <- gsub(pattern = "G|H|I", replacement = "_helix ", x = structurePorter5)
+structurePorter5 <- gsub(pattern = "B|E", replacement = "_sheet ", x = structurePorter5)
+structurePorter5 <- gsub(pattern = "[T|S|\\.]", replacement = "_coil ", x = structurePorter5)
+
+cat("After\n")
+structurePorter5[3]
+```
+
+Now for word2vec the easiest way to put our sequences in excisting libraries is 
+to make the sequences into sentences with the 20 amino acids * 3 classes (60 "words") 
+as words with spaces inbetween them. These will be the 1-grams. We can also make 
+2-grams so we will have 60*60 = 3600 "words". We will do this below
+
+First the 1 grams
+```{r}
+# Split the sequences and structure in vectors so we can combine them
+# For sequence we use boundary to break at each character
+sequencePorter5 <-
+  mclapply(1:length(sequencePorter5), function (x)
+    str_split(sequencePorter5[x],
+              pattern = boundary("character")),
+    mc.cores = 7)
+
+# For structure we use boundary to break at the spaces
+structurePorter5 <-
+  mclapply(1:length(structurePorter5), function (x)
+    str_split(structurePorter5[x],
+              pattern = boundary("word")),
+    mc.cores = 7)
+
+# str_c combines vectors ellements wise and collapse with " ", like advanced paste0 
+sentencesPorter5 <-
+  mclapply(1:length(structurePorter5), function (x)
+    str_c(sequencePorter5[[x]][[1]], structurePorter5[[x]][[1]], collapse = " "))
+
+# And lets just make it to a df so we can check it easier
+# stringsAsFactors = FALSE or else it will all be converted which is a waste
+# add original sequences and structures as meta data
+sentencesPorter5 <- as.data.frame(unlist(sentencesPorter5), stringsAsFactors
+                                  = FALSE)
+colnames(sentencesPorter5) <- "Sentences1gram"
+sentencesPorter5$Sequences <- sequencePorter5Original
+sentencesPorter5$Structures <- structurePorter5Original
+
+cat("The sequence\n")
+sentencesPorter5[1,2]
+cat("\n\nThe SS\n")
+sentencesPorter5[1,3]
+
+cat("\n\nThe \"sentence\"")
+sentencesPorter5[1,1]
+```
+
+Now for the 2-grams
+```{r}
+# Remove the first entry of each sequence, so that our 2-gram model can move through
+# without skipping half of the information. Example how we would miss half of the
+# information: [xxx] is the 2gram we are getting surroundings info for:
+# ...[AsheetB_sheet] CsheetDsheet EsheetFsheet...
+# ...Asheet [BsheetCsheet] DsheetEsheet Fsheet...
+
+sentences2Gram_1 <- as.vector(sentencesPorter5$Sentences1gram)
+sentences2Gram_2 <- sub("^......? ", "", sentences2Gram_1) #  Remove first entry,
+#  for when we make 2grams everything will shift 1 entry
+
+# Function to remove first space and then every other space
+# input is a 1gram sentence, output is 2gram sentence
+make2Gram <- function(x){ #  x is our "sentence"
+  x <- sub(" ", "", x) #  remove first space to combine to 2gram
+  x <- gsub("([^ ]+ [^ ]+) ", "\\1", x) #  combine every other entry
+  return(x)     
+}
+
+# Make 2 grams out of both vectors
+sentences2Gram_1 <- unlist(mclapply(X = sentences2Gram_1, make2Gram, mc.cores = 6))
+
+sentences2Gram_2 <- unlist(mclapply(X = sentences2Gram_2, make2Gram, mc.cores = 6))
+
+# Some "sentences" now have one 1 gram at the end if they had odd length 
+sentences2Gram_1 <- gsub(" ......?$", "", sentences2Gram_1)
+
+
+sentences2Gram_2 <- gsub(" ......?$", "", sentences2Gram_2)
+
+# Now we combine each of the sentences that belong together in alternating fashion
+# So the order becomes for each sentence in the lists created above: 
+# Input: sentences2Gram_1: 2-gram 1, 2-gram 3, 2-gram 5
+# Input: sentences2Gram_2: 2-gram 2, 2-gram 4, 2-gram 6
+# Output: sentences2Gram: 2-gram 1, 2-gram 2, 2-gram 3, 2-gram 4 etc
+
+# We do this by for each sentence in the two lists, by splitting them into
+# elements of vector for each 2-gram. Creating an empty vector with the length
+# of both vectors. And then alternately filling this vector with the 2-grams and
+# use paste0 to make one big character out of it again:
+
+sentences2Gram <-
+  mclapply(1:length(c(sentences2Gram_1)), mc.cores = 6,
+           function(x) {
+             # Split vectors of matching sentences
+             sentence2Gram_1Temp <- unlist(str_split(sentences2Gram_1[x], pattern = " "))
+             sentence2Gram_2Temp <- unlist(str_split(sentences2Gram_2[x], pattern = " "))
+             # Empty vector to fill
+             sentence2GramTemp <-
+               vector(class(sentence2Gram_1Temp), length(c(
+                 sentence2Gram_1Temp, sentence2Gram_2Temp
+               )))
+             # Fill alternately
+             sentence2GramTemp[c(TRUE, FALSE)] <-
+               sentence2Gram_1Temp
+             sentence2GramTemp[c(FALSE, TRUE)] <-
+               sentence2Gram_2Temp
+             # Collapse into one character vector
+             sentence2GramTemp <- paste0(sentence2GramTemp, collapse = " ")
+             return(sentence2GramTemp)
+           })
+
+# Now we can see the output
+cat("2 grams of the first sentence, starting at first position\n")
+sentences2Gram_1[1]
+
+cat("\n2 grams of the first sentence, starting at second position\n")
+sentences2Gram_2[1]
+
+cat("\n2 grams of the whole sentence\n")
+sentences2Gram[1]
+
+# And add to our dataframe
+sentences2Gram <- as.data.frame(unlist(sentences2Gram), stringsAsFactors
+                                  = FALSE)
+colnames(sentences2Gram) <- "Sentences2gram"
+sentencesPorter5 <- cbind(sentencesPorter5, sentences2Gram)
+
+# Store it so we do not have to run it all again
+write.csv(sentencesPorter5, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sentencesPorter5.csv")
+```
+
+## Hemolytic peptides to "sentences" of sequence and structure
+Now we do the same for the hemolytic/nonhemolytic peptides. We will also add
+the hemolytic class information which will just make our life easier later on.
+
+```{r}
+# Dataset of hemolytic and non hemolytic peptides, only need sequence and hemolytic info
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+dataset <- dataset[,c("Sequence", "Hemolytic")]
+
+# Secondary structure
+SS3 <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/ss3Df.csv")
+
+# We only need the sequence (X) and the secondary structure (SS)
+SS3 <- SS3[,c("X", "SS")]
+colnames(SS3) <- c("Sequence","SS")
+
+# Then we need to match our hemolytic info to secondary structure
+dataset <- merge(dataset, SS3, by = "Sequence")
+
+# Get out sequences and structures so we can make sentences out of them
+# Sequences we can just store
+sequences <- as.character(dataset$Sequence)
+
+# Secondary structures we need to modify a bit 
+secondaryStructures <- as.character(dataset$SS)
+secondaryStructures <- gsub(pattern = "H", replacement = "helix ", x = secondaryStructures)
+secondaryStructures <- gsub(pattern = "E", replacement = "sheet ", x = secondaryStructures)
+secondaryStructures <- gsub(pattern = "C", replacement = "coil ", x = secondaryStructures)
+```
+
+
+Make 1-gram sentences out of the above information
+```{r}
+# Split the sequences and structure in vectors so we can combine them
+# For sequence we use boundary to break at each character
+sequences <-
+  mclapply(1:length(sequences), function (x)
+    str_split(sequences[x],
+              pattern = boundary("character")),
+    mc.cores = 7)
+sequences[[1]]
+
+# For structure we use boundary to break at the spaces
+secondaryStructures <-
+  mclapply(1:length(secondaryStructures), function (x)
+    str_split(secondaryStructures[x],
+              pattern = boundary("word")),
+    mc.cores = 7)
+secondaryStructures[[1]]
+
+# str_c combines vectors ellements wise and collapse with " ", like advanced paste0 
+sentences <-
+  mclapply(1:length(secondaryStructures), function (x)
+    str_c(sequences[[x]][[1]], secondaryStructures[[x]][[1]], collapse = " "))
+sentences[[1]]
+
+# Cbind with our dataset
+sentences <- as.data.frame(unlist(sentences), stringsAsFactors
+                                  = FALSE)
+colnames(sentences) <- "Sentences1gram"
+dataset <- cbind(dataset, sentences)
+```
+
+Now for the 2-grams
+
+```{r}
+# Remove the first entry of each sequence, so that our 2-gram model can move through
+# without skipping half of the information. Example how we would miss half of the
+# information: [xxx] is the 2gram we are getting surroundings info for:
+# ...[AsheetB_sheet] CsheetDsheet EsheetFsheet...
+# ...Asheet [BsheetCsheet] DsheetEsheet Fsheet...
+
+sentences2Gram_1 <- as.vector(dataset$Sentences1gram)
+sentences2Gram_2 <- sub("^......? ", "", sentences2Gram_1) #  Remove first entry,
+#  and if we make 2grams everything will shift 1 entry
+
+# Function to remove first space and then every other space
+# input is a 1gram sentence, output is 2gram sentence
+make2Gram <- function(x){ #  x is our "sentence"
+  x <- sub(" ", "", x) #  remove first space to combine to 2gram
+  x <- gsub("([^ ]+ [^ ]+) ", "\\1", x) #  combine every other entry
+  return(x)     
+}
+
+# Make 2 grams out of both vectors
+sentences2Gram_1 <- unlist(mclapply(X = sentences2Gram_1, make2Gram, mc.cores = 6))
+
+sentences2Gram_2 <- unlist(mclapply(X = sentences2Gram_2, make2Gram, mc.cores = 6))
+
+# Some "sentences" now have one 1 gram at the end if they had odd length 
+sentences2Gram_1 <- gsub(" ......?$", "", sentences2Gram_1)
+
+
+sentences2Gram_2 <- gsub(" ......?$", "", sentences2Gram_2)
+
+# Now we combine each of the sentences that belong together in alternating fashion
+# So the order becomes for each sentence in the lists created above: 
+# Input: sentences2Gram_1: 2-gram 1, 2-gram 3, 2-gram 5
+# Input: sentences2Gram_2: 2-gram 2, 2-gram 4, 2-gram 6
+# Output: sentences2Gram: 2-gram 1, 2-gram 2, 2-gram 3, 2-gram 4 etc
+
+# We do this by for each sentence in the two lists, by splitting them into
+# elements of vector for each 2-gram. Creating an empty vector with the length
+# of both vectors. And then alternately filling this vector with the 2-grams and
+# use paste0 to make one big character out of it again:
+
+sentences2Gram <-
+  mclapply(1:length(c(sentences2Gram_1)), mc.cores = 6,
+           function(x) {
+             # Split vectors of matching sentences
+             sentence2Gram_1Temp <- unlist(str_split(sentences2Gram_1[x], pattern = " "))
+             sentence2Gram_2Temp <- unlist(str_split(sentences2Gram_2[x], pattern = " "))
+             # Empty vector to fill
+             sentence2GramTemp <-
+               vector(class(sentence2Gram_1Temp), length(c(
+                 sentence2Gram_1Temp, sentence2Gram_2Temp
+               )))
+             # Fill alternately
+             sentence2GramTemp[c(TRUE, FALSE)] <-
+               sentence2Gram_1Temp
+             sentence2GramTemp[c(FALSE, TRUE)] <-
+               sentence2Gram_2Temp
+             # Collapse into one character vector
+             sentence2GramTemp <- paste0(sentence2GramTemp, collapse = " ")
+             return(sentence2GramTemp)
+           })
+
+# Now we can see the output
+cat("2 grams of the first sentence, starting at first position\n")
+sentences2Gram_1[1]
+
+cat("\n2 grams of the first sentence, starting at second position\n")
+sentences2Gram_2[1]
+
+cat("\n2 grams of the whole sentence\n")
+sentences2Gram[1]
+
+# Cbind with our dataset
+sentences2Gram <- as.data.frame(unlist(sentences2Gram), stringsAsFactors
+                                  = FALSE)
+colnames(sentences2Gram) <- "Sentences2gram"
+dataset <- cbind(dataset, sentences2Gram)
+
+# Let's safe that also
+write.csv(dataset, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sentencesHemoDataset.csv")
+```
+
+# Load datasets
+
+```{r}
+# Load our datasets
+sentencesPorter5 <- read.csv("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sentencesPorter5.csv")
+sentencesPorter5$X <- NULL
+
+sentencesHemo <- read.csv("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sentencesHemoDataset.csv")
+sentencesHemo$X <- NULL
+```
+
+## Word2vec model training
+Now that we have our input information in the right structure we can train 
+our word2vec representations of the information
+
+I have no idea what works best, training word2vec on only Porter5, only hemo peps 
+or on the two of them combined. For now I just run them all and I will see what I
+do with them.
+
+First for the 1-gram model. When we create features out of this for our peptides
+we can just sum the learned vector for each amino acid/structure in the peptide.
+These vectors are small in memory space so we can increase the dimensions: we will 
+use 300, which has been succesfully used in plenty of NLP and protein applications. 
+For a matrix with the representative feature per amino acid/secondary 
+structure we will use 100 dims. Because running a cnn over ~3800 matrices
+of 133 by 300 is just undoable on my laptop (I doubt 133 by 100 will be smooth but
+we will see). From literature on peptide class predictions a window 25 seems to 
+work well. But these are only amino acid representations. We will try 5, 15 and 25.
+From literature window size in NLP seems to affect word relations. For example
+small windows size for apple the vector is near other fruits, and for a bigger window 
+apple matches foods more in general.
+
+```{r}
+# Extract sentences as vector so word2vec can use them
+sentences1GramPorter5 <- as.vector(sentencesPorter5$Sentences1gram)
+sentences1GramHemo <- as.vector(sentencesHemo$Sentences1gram)
+sentences1GramCombined <- c(sentences1GramPorter5, sentences1GramHemo)
+  
+# "_" as seperator looked good but word2vec will split it as seperate words...
+sentences1GramPorter5 <- gsub("_", "", x = sentences1GramPorter5)
+sentences1GramCombined <- gsub("_", "", x = sentences1GramCombined)
+
+# Train our model and we store it
+# Skipgram because it is more precise 
+# We vary dims and window size
+# Iter at just a high number, stackexchange says after 20 doesnt really matter
+# Run time: Like 1 hour?
+cl <- makeCluster(6)
+makeCluster(cl)
+
+sentencesList <- list()
+sentencesList[[1]] <- sentences1GramPorter5
+sentencesList[[2]] <- sentences1GramHemo
+sentencesList[[3]] <- sentences1GramCombined
+names(sentencesList) <- c("sentences1GramPorter5","sentences1GramHemo", "sentences1GramCombined")
+
+lapply(list(1, 2, 3), 
+       function(x) {
+         foreach(dim = c(100,300)) %do% {
+  foreach(window = c(5,15,25)) %do% {
+    name <- names(sentencesList[x])
+    modelSentences1gram <- word2vec(
+      x = sentencesList[[x]],
+      type = "skip-gram",
+      dim = dim,
+      window = window,
+      threads = 6,
+      iter = 20,
+      min_count = 1
+    )
+    
+    write.word2vec(
+    modelSentences1gram,
+    paste0(
+      "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/",name,"Dim",
+      dim ,
+      "Window",
+      window,
+      ".bin"
+    )
+    )
+  }
+}
+})
+stopCluster(cl)
+```
+
+Now for the 2-gram model
+```{r}
+# Remove the first entry of each sequence, so that our 2-gram model can move through
+# without skipping half of the information. Example how we would miss half of the
+# information: [xxx] is the 2gram we are getting surroundings info for:
+# ...[A_sheetB_sheet] C_sheetD_sheet E_sheetF_sheet...
+# ...A_sheet [B_sheetC_sheet] D_sheetE_sheet Fsheet...
+
+# Extract sentences as vector so word2vec can use them
+sentences2gramPorter5 <- as.vector(sentencesPorter5$Sentences2gram)
+sentences2gramHemo <- as.vector(sentencesHemo$Sentences2gram)
+sentences2gramCombined <- c(sentences2gramPorter5, sentences2gramHemo)
+  
+# "_" as seperator looked good but word2vec will split it as seperate words...
+sentences2gramPorter5 <- gsub("_", "", x = sentences2gramPorter5)
+sentences2gramCombined <- gsub("_", "", x = sentences2gramCombined)
+
+# Train our model and we store it
+# Skipgram because it is more precise 
+# We vary dims and window size
+# Iter at just a high number, stackexchange says after 20 doesnt really matter
+# Run time: Like 1 hour?
+cl <- makeCluster(6)
+makeCluster(cl)
+
+sentencesList <- list()
+sentencesList[[1]] <- sentences2gramPorter5
+sentencesList[[2]] <- sentences2gramHemo
+sentencesList[[3]] <- sentences2gramCombined
+names(sentencesList) <- c("sentences2gramPorter5","sentences2gramHemo", "sentences2gramCombined")
+
+lapply(list(1, 2, 3), 
+       function(x) {
+         foreach(dim = c(100,300)) %do% {
+  foreach(window = c(5,15,25)) %do% {
+    name <- names(sentencesList[x])
+    modelSentences2gram <- word2vec(
+      x = sentencesList[[x]],
+      type = "skip-gram",
+      dim = dim,
+      window = window,
+      threads = 6,
+      iter = 20,
+      min_count = 1
+    )
+    
+    write.word2vec(
+    modelSentences2gram,
+    paste0(
+      "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/",name,"Dim",
+      dim ,
+      "Window",
+      window,
+      ".bin"
+    )
+    )
+  }
+}
+})
+stopCluster(cl)
+```
+
+
+# Comparison word2vec models on only amino acids
+Lastly it is good if we can compare our sequence + SS to another representation.
+We will use representations based on only the primary structure for this. I have 
+downloaded representations learned on 3-grams of amino acids (100 dims, window 25) 
+from  https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0141287
+
+I will also train a word2vec model on just the amino acids of our hemo/non-hemo
+sequences.
+
+```{r}
+# Dataset of hemolytic and non hemolytic peptides, only need sequence and hemolytic info
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+dataset <- dataset[,c("Sequence", "Hemolytic")]
+
+# Store sequences
+sequences <- as.character(dataset$Sequence)
+# Add spaces inbetween amino acids
+sequences <- gsub(x = sequences, pattern = "([A-Z])", replacement = "\\1 ")
+
+# Split sequence into 3-grams, this wil give 20^3 = 8000 possible 3-grams.
+sequences3Gram_1 <- sequences
+sequences3Gram_2 <- sub("^. ", "", sequences3Gram_1) #  Remove first entry,
+sequences3Gram_3 <- sub("^. ", "", sequences3Gram_2) #  Remove again first entry,
+#  and if we make 3grams everything will shift 1 entry twice
+
+# Function to remove first space and then every other space
+# input is a 1gram sentence, output is 2gram sentence
+make3Gram <- function(x){ #  x is our "sentence"
+  x <- gsub("(.) (.) (.)",  "\\1\\2\\3", x) #  combine every three amino acids
+  x <- gsub(" . . ", "", x) # Remove left over amino acids at the end
+  x <- gsub(" . ", "", x) # Remove left over amino acids at the end
+  x <- sub("(...) $", "\\1", x) # Remove space at the end
+  x <- gsub(" .$", "", x) # Remove left over amino acids at the end
+  return(x)     
+}
+
+# Make 3 grams out of the three sequence vectors
+sequences3Gram_1 <- unlist(mclapply(X = sequences3Gram_1, make3Gram, mc.cores = 6))
+sequences3Gram_2 <- unlist(mclapply(X = sequences3Gram_2, make3Gram, mc.cores = 6))
+sequences3Gram_3 <- unlist(mclapply(X = sequences3Gram_3, make3Gram, mc.cores = 6))
+
+
+# Now we combine each of the sentences that belong together in alternating fashion
+# So the order becomes for each sentence in the lists created above: 
+# Input: sequences3Gram_1: 3-gram 1, 3-gram 2
+# Input: sequences3Gram_2: 3-gram 3, 3-gram 4
+# Input: sequences3Gram_3: 3-gram 5, 3-gram 6
+# Output: sequences3Gram: 3-gram 1, 3-gram 3, 3-gram 5 etc
+
+# We do this by for each sentence in the two lists, by splitting them into
+# elements of vector for each 2-gram. Creating an empty vector with the length
+# of both vectors. And then alternately filling this vector with the 2-grams and
+# use paste0 to make one big character out of it again:
+
+sequences3Gram <-
+  mclapply(1:length(c(sequences3Gram_1)), mc.cores = 6,
+           function(x) {
+             # Split vectors of matching sentences
+             sequences3Gram_1Temp <- unlist(str_split(sequences3Gram_1[x], pattern = " "))
+             sequences3Gram_2Temp <- unlist(str_split(sequences3Gram_2[x], pattern = " "))
+             sequences3Gram_3Temp <- unlist(str_split(sequences3Gram_3[x], pattern = " "))
+             # Empty vector to fill
+            sequences3GramTemp <-
+               vector(class(sequences3Gram_1Temp), length(c(
+                 sequences3Gram_1Temp, sequences3Gram_2Temp, sequences3Gram_3Temp
+               )))
+             # Fill alternately
+             sequences3GramTemp[c(TRUE, FALSE, FALSE)] <-
+               sequences3Gram_1Temp
+             sequences3GramTemp[c(FALSE, TRUE, FALSE)] <-
+               sequences3Gram_2Temp
+             sequences3GramTemp[c(FALSE, FALSE, TRUE)] <-
+               sequences3Gram_3Temp
+             # Collapse into one character vector
+             sequences3GramTemp <- paste0(sequences3GramTemp, collapse = " ")
+             # Some still have too short n-grams at the end
+             sequences3GramTemp <- gsub(" .$", "", sequences3GramTemp)
+             sequences3GramTemp <- gsub(" . .$", "", sequences3GramTemp)
+             
+             return(sequences3GramTemp)
+           })
+
+cat("Original sequence\n")
+sequences[1]
+# Now we can see the output
+cat("\n3 grams of the first sentence, starting at first position\n")
+sequences3Gram_1[1]
+
+cat("\n3 grams of the first sentence, starting at second position\n")
+sequences3Gram_2[1]
+
+cat("\n3 grams of the first sentence, starting at third position\n")
+sequences3Gram_3[1]
+
+cat("\n3 grams of the whole sentence\n")
+sequences3Gram[1]
+
+# Store as df
+sequences <- as.data.frame(unlist(sequences3Gram), stringsAsFactors
+                                  = FALSE)
+colnames(sequences) <- "Sequences3gram"
+dataset <- cbind(dataset, sequences)
+
+write.csv(dataset, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sequences3GramHemoDataset.csv")
+```
+And train the word2vec weights
+
+```{r}
+modelHemoSequence3gram100Dim <- word2vec(
+      x = unlist(sequences3Gram),
+      type = "skip-gram",
+      dim = 100,
+      window = 25,
+      threads = 6,
+      iter = 20,
+      min_count = 1
+    )
+
+write.word2vec(modelHemoSequence3gram100Dim, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/modelHemoSequence3gram100Dim.bin")
+
+modelHemoSequence3gram300Dim <- word2vec(
+      x = unlist(sequences3Gram),
+      type = "skip-gram",
+      dim = 300,
+      window = 25,
+      threads = 6,
+      iter = 20,
+      min_count = 1
+    )
+write.word2vec(modelHemoSequence3gram300Dim, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/modelHemoSequence3gram300Dim.bin")
+```
+
+
+
+

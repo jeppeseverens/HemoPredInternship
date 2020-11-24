@@ -1,0 +1,993 @@
+    
+```{r}
+library(stringr)
+library(ggplot2)
+library(ggridges)
+library(hrbrthemes)
+library(ggpubr)
+library(envalysis)
+library(uwot)
+library(Rtsne)
+library(parallel)
+library(factoextra)
+library(viridis)
+library(dplyr)
+library(protr)
+```
+
+In this file we are going to do some analysises of our dataset and create some figures
+
+#Database analysis
+First lets load our db
+```{r}
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+sequences <- as.vector(dataset$Sequence)
+
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+train <- dataset[dataset$Sequence %in% trainTest[["train"]],]
+train$Sequence <- NULL
+test <- dataset[dataset$Sequence %in% trainTest[["test"]],]
+test$Sequence <- NULL
+```
+
+Let's see how many peptides we started with in each of the three datasets 
+(HemoPi, Hlppred and HAPPENN) and with how many peptides we ended up in our final
+dataset.
+
+First we need our function again to read fastas 
+```{r}
+# Function to extract fasta. Inputs are path and pattern
+# path - folder where the fasta files are located 
+# pattern - pattern of the file name(s)
+# Output is peptide sequences as character vector
+extractFASTA <- function(path, pattern) {
+  # Lists the files
+  fastas <-
+    list.files(path = path,
+               pattern = pattern,
+               full.names = TRUE)
+  # Read all lines of all files and puts them in a vector
+  fastas <- unlist(lapply(fastas, readLines))
+  # Remove the names of the sequences, which is always on the first line,
+  # then removes doubles
+  fastas <- unique(fastas[c(FALSE, TRUE)])
+  return(fastas)
+}
+```
+
+And let's load the datasets we have used and analyse them.
+
+```{r}
+# HemoPI sequences, split in pos and negs
+posHemopi <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HemoPI/", 
+                          pattern = ".*3.*pos.*.fa") 
+negHemopi <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HemoPI/",
+                          pattern = ".*3.*neg.*.fa")
+
+cat("Amount all HemoPI peps, pos and neg\n")
+length(c(negHemopi, posHemopi))
+length(posHemopi)
+length(negHemopi)
+
+
+# HLPpred sequences, split in pos and negs
+posHlppred <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HLPpred", 
+                           pattern = ".*2.*positive.txt")
+negHlppred <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HLPpred", 
+                           pattern = ".*2.*negative.txt")
+
+cat("Amount all HLPpred peps, pos and neg\n")
+length(c(posHlppred, negHlppred))
+length(posHlppred)
+length(negHlppred)
+
+
+# Happenn
+# Read fasta file
+HAPPENN <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/HAPPENN/HAPPENN_dataset.fasta")
+# Store as dataframe 1 column metadata, 1 column sequence and add colnames
+HAPPENN <- as.data.frame(matrix(HAPPENN,ncol =2,byrow = T)) 
+colnames(HAPPENN) <- c("Hemolytic", "Sequence") 
+
+# Change non-hemolytic metadata to 0 and hemolytic to 1
+# and store as vectors by class
+HAPPENN$Hemolytic <- gsub(".*.non-hemolytic", "0", x = HAPPENN$Hemolytic) 
+HAPPENN$Hemolytic <- gsub(".*.hemolytic", "1", x = HAPPENN$Hemolytic)
+
+posHappenn <- as.character(HAPPENN[which(HAPPENN$Hemolytic == 1), 2]) 
+negHappenn <- as.character(HAPPENN[which(HAPPENN$Hemolytic == 0), 2])
+
+cat("Amount all HAPPENN peps, pos and neg\n")
+length(c(posHappenn, negHappenn))
+summary(str_length(posHappenn))
+  length(posHappenn)
+length(negHappenn)
+```
+
+Here we can find out how many peptides we started with and how many we ended up 
+with after combining everything. I used this for the flowchart figure in the results 
+
+```{r}
+# Combine HemoPi and HLPpred and remove duplicates
+expPos <- c(posHemopi, posHlppred, posHappenn)
+expNeg <- c(negHemopi, negHlppred, negHappenn)
+
+cat("Amount all combined peps, pos and neg\n")
+length(c(expPos, expNeg))
+length(expPos)
+length(expNeg)
+
+expPos <- stringi::stri_unique(expPos)
+expNeg <- stringi::stri_unique(expNeg)
+
+cat("Amount all unqiue peps per class, pos and neg\n")
+length(c(expPos, expNeg))
+length(expPos)
+length(expNeg)
+
+# Remove sequences that are in both the combined pos and neg datasets
+remove1 <- expNeg %in% expPos
+remove2 <- expPos %in% expNeg
+expNeg <- expNeg[!remove1] 
+expPos <- expPos[!remove2]
+
+cat("Amount of dataset peps, hemo and non-hemo after per class removal\n")
+length(c(expPos, expNeg))
+length(expPos)
+length(expNeg)
+```
+
+Also, lets check on how many peptides the HemoPred and HLPpred authors and
+HAPPENN authors disagreed.
+
+```{r}
+# Amount of peptides both HemoPi and Happenn reviewd and classified
+length(Reduce(intersect, list(posHemopi, posHappenn))) +
+  length(Reduce(intersect, list(negHemopi, negHappenn)))
+
+# Amount of peptides both HLPpred-fuse and Happenn reviewed and classified
+length(Reduce(intersect, list(posHlppred, posHappenn))) +
+  length(Reduce(intersect, list(negHlppred, negHappenn)))
+# Same
+
+# Amount of peptides they disagreed on
+length(Reduce(intersect, list(unique(
+  c(posHemopi, posHlppred, posHappenn)
+), unique(
+  c(negHemopi, negHlppred, negHappenn)
+))))
+
+# percentage they disagreed on
+  length(Reduce(intersect, list(unique(
+    c(posHemopi, posHlppred, posHappenn)
+  ), unique(
+    c(negHemopi, negHlppred, negHappenn)
+  )))) / (length(Reduce(intersect, list(
+    posHemopi, posHappenn
+  ))) +
+    length(Reduce(intersect, list(
+      negHemopi, negHappenn
+    )))) * 100
+  
+  # Also, do Hlppred and HemoPi disagree on any peps?
+length(Reduce(intersect, list(unique(
+  c(posHemopi, posHlppred)
+), unique(
+  c(negHemopi, negHlppred)
+))))
+
+# NO
+```
+
+
+More data, number of hemolytic and non hemolytic peps in main dataset
+
+```{r}
+cat("Number of total peps\n")
+nrow(dataset)
+cat("\nNumber of hemo peps and %\n")
+length(which(dataset$Hemolytic == 1))
+length(which(dataset$Hemolytic == 1))/nrow(dataset) * 100
+
+cat("\nNumber of nonhemo peps and %\n")
+length(which(dataset$Hemolytic == 0))
+length(which(dataset$Hemolytic == 0))/nrow(dataset) * 100
+```
+
+Now for the train and test set
+
+```{r}
+cat("Number of train peps\n")
+nrow(train)
+cat("\nNumber of hemo peps and %\n")
+length(which(train$Hemolytic == 1))
+length(which(train$Hemolytic == 1))/nrow(train) * 100
+
+cat("\nNumber of nonhemo pepsand %\n")
+length(which(train$Hemolytic == 0))
+length(which(train$Hemolytic == 0))/nrow(train) * 100
+
+cat("\nNumber of test peps\n")
+nrow(test)
+cat("\nNumber of hemo peps and %\n")
+length(which(test$Hemolytic == 1))
+length(which(test$Hemolytic == 1))/nrow(test) * 100
+
+cat("\nNumber of nonhemo pepsand %\n")
+length(which(test$Hemolytic == 0))
+length(which(test$Hemolytic == 0))/nrow(test) * 100
+
+```
+
+Number of linear/cyclic 
+
+```{r}
+cat("Number of linear and cyclic peps and percentages \n")
+length(which(dataset$Intrachainbond == "Linear"))
+length(which(dataset$Intrachainbond == "Linear"))/nrow(dataset) * 100
+length(which(dataset$Intrachainbond == "Cyclic"))
+length(which(dataset$Intrachainbond == "Cyclic"))/nrow(dataset) * 100
+```
+
+now for test/train again
+
+```{r}
+cat("TEST: Number of linear and cyclic peps and percentages \n")
+length(which(train$Intrachainbond == "Linear"))
+length(which(train$Intrachainbond == "Linear"))/nrow(train) * 100
+length(which(train$Intrachainbond == "Cyclic"))
+length(which(train$Intrachainbond == "Cyclic"))/nrow(train) * 100
+
+cat("TRAIN: Number of linear and cyclic peps and percentages \n")
+length(which(test$Intrachainbond == "Linear"))
+length(which(test$Intrachainbond == "Linear"))/nrow(test) * 100
+length(which(test$Intrachainbond == "Cyclic"))
+length(which(test$Intrachainbond == "Cyclic"))/nrow(test) * 100
+```
+
+Same for endterms
+
+```{r}
+cat("C_TERM_MODS: Number of free/amiditation peps and percentages \n")
+length(which(dataset$C_term_mod == "Free"))
+length(which(dataset$C_term_mod == "Free"))/nrow(dataset) * 100
+length(which(dataset$C_term_mod == "Amidation"))
+length(which(dataset$C_term_mod == "Amidation"))/nrow(dataset) * 100
+
+cat("N_TERM_MODS: Number of free/acetylatio/formylation peps and percentages \n")
+length(which(dataset$N_term_mod == "Free"))
+length(which(dataset$N_term_mod == "Free"))/nrow(dataset) * 100
+length(which(dataset$N_term_mod == "Acetylation"))
+length(which(dataset$N_term_mod == "Acetylation"))/nrow(dataset) * 100
+length(which(dataset$N_term_mod == "Formylation"))
+length(which(dataset$N_term_mod == "Formylation"))/nrow(dataset) * 100
+```
+
+now for test/train again
+
+```{r}
+cat("TRAIN: C_TERM_MODS: Number of free/amiditation peps and percentages \n")
+length(which(train$C_term_mod == "Free"))
+length(which(train$C_term_mod == "Free"))/nrow(train) * 100
+length(which(train$C_term_mod == "Amidation"))
+length(which(train$C_term_mod == "Amidation"))/nrow(train) * 100
+
+cat("TRAIN: N_TERM_MODS: Number of free/acetylatio/formylation peps and percentages \n")
+length(which(train$N_term_mod == "Free"))
+length(which(train$N_term_mod == "Free"))/nrow(train) * 100
+length(which(train$N_term_mod == "Acetylation"))
+length(which(train$N_term_mod == "Acetylation"))/nrow(train) * 100
+length(which(train$N_term_mod == "Formylation"))
+length(which(train$N_term_mod == "Formylation"))/nrow(train) * 100
+
+cat("TEST: C_TERM_MODS: Number of free/amiditation peps and percentages \n")
+length(which(test$C_term_mod == "Free"))
+length(which(test$C_term_mod == "Free"))/nrow(test) * 100
+length(which(test$C_term_mod == "Amidation"))
+length(which(test$C_term_mod == "Amidation"))/nrow(test) * 100
+
+cat("TEST: N_TERM_MODS: Number of free/acetylatio/formylation peps and percentages \n")
+length(which(test$N_term_mod == "Free"))
+length(which(test$N_term_mod == "Free"))/nrow(test) * 100
+length(which(test$N_term_mod == "Acetylation"))
+length(which(test$N_term_mod == "Acetylation"))/nrow(test) * 100
+length(which(test$N_term_mod == "Formylation"))
+length(which(test$N_term_mod == "Formylation"))/nrow(test) * 100
+```
+
+Now it is nice to visualise our sequence length distributions
+
+```{r}
+# Make df with length and class
+df <- data.frame("Length" = str_length(sequences), 
+                 "Hemolytic" = as.factor(dataset$Hemolytic)) 
+# Mean of positive and negative peptides for the graph
+posMean <- round(mean(df[which(df$Hemolytic == 1),1])) 
+negMean <- round(mean(df[which(df$Hemolytic == 0),1]))
+
+# Ggplots
+hemo_sequences_plot <-
+  ggplot(df[which(df$Hemolytic == 1),], aes(x = Length)) +
+  geom_histogram(binwidth = 1,
+                 center = 0,
+                 fill = "#FF000099",
+  ) +
+  theme_ridges(font_size = 12, center_axis_labels = TRUE) +
+  geom_vline(data = df,
+             aes(xintercept = posMean),
+             linetype = "dashed"
+  ) +
+  scale_x_continuous(limits = c(0, 135), breaks = seq(0, 135, 10)) +
+  xlab("Sequence length") + ylab("Number of sequences") + 
+  ggtitle("Hemolytic peptides") +
+  scale_y_continuous(limits = c(0, 150), breaks = seq(0, 150, 50)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+nonhemo_sequences_plot <-
+  ggplot(df[which(df$Hemolytic == 0), ], aes(x = Length)) +
+  geom_histogram(binwidth = 1,
+                 center = 0,
+                 fill = "#0000FF99") +
+  theme_ridges(font_size = 12, center_axis_labels = TRUE) +
+  geom_vline(data = df,
+             aes(xintercept = negMean),
+             linetype = "dashed") +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 10),
+    minor_breaks = seq(5, 135, 5)
+  ) +
+  xlab("Sequence length") + ylab("Number of sequences") +
+  ggtitle("Non-hemolytic peptides") +
+  scale_y_continuous(limits = c(0, 150), breaks = seq(0, 150, 50)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# "publication ready" figures
+ggarrange(hemo_sequences_plot, nonhemo_sequences_plot, 
+          labels = c("A", "B",ncol = 2, nrow = 1), 
+          legend = "right", common.legend = TRUE)
+```
+
+Some more information about length distribution
+
+```{r}
+cat("Summary of sequence length distribution of hemolytic peps\n")
+summary(df[which(df$Hemolytic == 1),1])
+cat("Summary of sequence length distribution of non-hemolytic peps\n")
+summary(df[which(df$Hemolytic == 0),1])
+```
+
+We also analyse the amino acid compositon by plotting per amino acid the
+AAC for the positive, negative and random peptides
+
+```{r}
+# Load in our dataset with the AAC and DC
+datasetAAC <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+
+# Easier to select correct columns
+AADict <- c("A", "R", "N", "D", "C", "E", "Q", "G", "H", 
+        "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+# Take the AAC for the positives and the negatives
+datasetAACpos <- datasetAAC[which(datasetAAC$Hemolytic == 1), AADict]
+datasetAACneg <- datasetAAC[which(datasetAAC$Hemolytic == 0), AADict]
+
+# Take the mean and sd for each amino acid in the AAC, positives and negatives
+meanAACpos <- unlist(lapply(1:ncol(datasetAACpos), function(x) mean(datasetAACpos[,x])))
+sdAACpos <- unlist(lapply(1:ncol(datasetAACpos), function(x) sd(datasetAACpos[,x])))
+
+meanAACneg <- unlist(lapply(1:ncol(datasetAACpos), function(x) mean(datasetAACneg[,x])))
+sdAACneg <- unlist(lapply(1:ncol(datasetAACpos), function(x) sd(datasetAACneg[,x])))
+
+# Load random sequences I just downloaded from SwissProt
+randomSequences4to40 <- unique(readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/SwissProt/uniprot-length[4+TO+40]+reviewed+yes.fasta")[c(FALSE, TRUE)])
+  # Remove non 20 canonical amino acids, just remove every peptide with weird amino acids
+randomSequences4to40 <- randomSequences4to40[!grepl(paste0(c("B", "X", "J", "O", "Z", "U"),collapse = "|"), randomSequences4to40)] 
+
+# Get the AAC, make df, transpose, sort columns according to AADict
+datasetAACran <- t(as.data.frame(lapply(randomSequences4to40, extractAAC)))[, AADict]
+# Get mean and sd per amino acid 
+meandatasetAACran <- unlist(lapply(1:ncol(datasetAACran), function(x) mean(datasetAACran[,x])))
+sddatasetAACran <- unlist(lapply(1:ncol(datasetAACran), function(x) sd(datasetAACran[,x])))
+
+df_2 <- rbind(
+  data.frame(AADict, meanAACpos, sdAACpos, "Hemolytic peptides", fix.empty.names = FALSE), 
+  data.frame(AADict, meanAACneg, sdAACneg, "Non-hemolytic peptides", fix.empty.names = FALSE), 
+  data.frame(AADict, meandatasetAACran, sddatasetAACran, "Swiss-Prot peptides", fix.empty.names = FALSE))
+colnames(df_2) <- c("AminoAcids", "Frequency", "SD", "Group")
+```
+
+
+Make a plot out of it. I dont know how relevant the SD is here
+
+```{r}
+aacPlotSD <- ggplot(data=df_2, aes(x=AminoAcids, y=Frequency, fill= Group)) +
+  geom_bar(stat="identity", position=position_dodge()) + scale_fill_manual(values=c('#e41a1c','#386cb0','#4daf4a')) + theme_ridges(font_size = 12,center_axis_labels = TRUE) + xlab("Amino acid") + ylab("Mean frequency") + ggtitle("Amino acid frequency for hemolytic, non-hemolytic and Swiss-Prot peptides") + theme(plot.title = element_text(hjust = 0.5)) +
+  geom_errorbar(aes(ymin=Frequency-SD, ymax=Frequency+SD), width=.2,
+                 position=position_dodge(.9)) 
+aacPlotSD
+```
+
+One without SD
+
+```{r}
+aacPlot <- ggplot(data=df_2, aes(x=AminoAcids, y=Frequency)) +
+  geom_bar(aes(fill = Group), stat="identity", position=position_dodge()) + scale_fill_manual(values=c('#e41a1c','#386cb0','#4daf4a')) + theme_ridges(font_size = 12,center_axis_labels = TRUE) + xlab("Amino acid") + ylab("Mean frequency") + ggtitle("Amino acid frequency for hemolytic, non-hemolytic and Swiss-Prot peptides") + theme(plot.title = element_text(hjust = 0.5))
+aacPlot
+```
+
+Of course it is nice to know if a t-test or wilcoxon test supplies us with more
+statistical insights here on differences between groups
+
+```{r}
+# Add group to datasets with AAC info
+datasetAACpos$Group <- "Hemolytic peptides"
+datasetAACneg$Group <- "Non-hemolytic peptides"
+datasetAACran <- data.frame(datasetAACran)
+datasetAACran$Group <- "Swiss-Prot peptides"
+# Combine into one df
+dfAACCombined <- rbind(datasetAACpos, datasetAACneg, datasetAACran)
+
+# Is it normally distributed? (no), but also not symtrically distributed on both sides of the median...
+shapiro.test(sample(dfAACCombined$A, 5000))
+shapiro.test(sample(dfAACCombined$K, 5000))
+
+# So to do test or wilcoxon? I dont know
+# ttest
+tTestMultiple <- function(col, dta){
+  dta %>%
+    rstatix::t_test(as.formula(paste0(col," ~ Group")),
+                             p.adjust.method = "bonferroni")
+}
+tTestComparison <- lapply(AADict ,tTestMultiple, dta = dfAACCombined)
+names(tTestComparison) <- AADict
+
+# Wilcoxon
+wilcoxonMultiple <- function(col, dta){
+  dta %>%
+    rstatix::wilcox_test(as.formula(paste0(col," ~ Group")),
+                             p.adjust.method = "bonferroni")
+}
+wilcoxonComparison <- lapply(AADict ,wilcoxonMultiple, dta = dfAACCombined)
+names(wilcoxonComparison) <- AADict
+
+tTestComparison[[1]] # this makes sense
+wilcoxonComparison[[1]] # This does not
+```
+
+We can do the same for the SSC. We will compare the SSC of the pos, neg and porter5 proteins as "normal"/comparison
+
+```{r}
+# Get positive sequences
+expPos <- as.vector(readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/expHemo.fasta")[c(FALSE, TRUE)])
+# Get negative sequences
+expNeg <- as.vector(readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/expNonHemo.fasta")[c(FALSE, TRUE)])
+
+# Get SSC
+SS3 <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/ss3Df.csv")
+SS3 <- SS3[,c("X","Coil", "Helix", "Sheet")]
+
+# Match SSCs for pos and neg
+SS3_pos <- SS3[SS3$X %in% expPos,]
+SS3_pos$X <- NULL
+SS3_neg <- SS3[SS3$X %in% expNeg,]
+SS3_neg$X <- NULL
+
+# Calculate mean and SD
+meanSSCpos <- unlist(lapply(1:ncol(SS3_pos), function(x) mean(SS3_pos[,x])))
+sdSSCpos <- unlist(lapply(1:ncol(SS3_pos), function(x) sd(SS3_pos[,x])))
+
+meanSSCneg <- unlist(lapply(1:ncol(SS3_neg), function(x) mean(SS3_neg[,x])))
+sdSSCneg <- unlist(lapply(1:ncol(SS3_neg), function(x) sd(SS3_neg[,x])))
+
+# Import Porter5 datasets
+Porter5 <- c(readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/Porter5_SS/test.set"),
+             readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/Porter5_SS/train.set"))
+# We only need 3. and 4. as information
+sequencePorter5 <- Porter5[c(FALSE, FALSE, TRUE, FALSE, FALSE)]
+structurePorter5 <- Porter5[c(FALSE, FALSE, FALSE, TRUE, FALSE)]
+
+# Remove unnatural amino acids, regex so I can remove information from both vectors
+AADict <- c("A", "R", "N", "D", "C", "E", "Q", "G", "H", 
+        "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+regex <- paste(c("[^", paste(AADict, collapse = "|"), "]"), collapse = "")
+# Which sequences do not have amino acids other than the above?
+keep <- !(grepl(regex, sequencePorter5))
+# We keep those
+sequencePorter5 <- sequencePorter5[keep]
+structurePorter5 <- structurePorter5[keep]
+
+# Set to three class structures
+structurePorter5 <- gsub(pattern = "G|H|I", replacement = "H", x = structurePorter5)
+structurePorter5 <- gsub(pattern = "B|E", replacement = "E", x = structurePorter5)
+structurePorter5 <- gsub(pattern = "[T|S|L|\\.]", replacement = "C", x = structurePorter5)
+
+# Function to get SSC from porter5 data
+extractSSC <- function(SS) {
+  SSDict <- c("C", "H", "E")
+  SSC <- as.vector(summary(factor(strsplit(SS, split = "")[[1]], levels = SSDict), 
+        maxsum = 4)/nchar(SS))
+}
+
+# Get SSCs from porter5 data
+SSCPorter5 <- t(as.data.frame(lapply(structurePorter5, extractSSC)))
+# Get mean and SD
+meanSSCPorter5 <- unlist(lapply(1:ncol(SSCPorter5), function(x) mean(SSCPorter5[,x])))
+sdSSCPorter5 <- unlist(lapply(1:ncol(SSCPorter5), function(x) sd(SSCPorter5[,x])))
+
+
+# Create DF for ggplot
+SSDict <- c("Coil", "Helix", "Sheet")
+df_3 <- rbind(
+  data.frame(SSDict, meanSSCpos, sdSSCpos, "Hemolytic peptides", fix.empty.names = FALSE), 
+  data.frame(SSDict, meanSSCneg, sdSSCneg, "Non-hemolytic peptides", fix.empty.names = FALSE), 
+  data.frame(SSDict, meanSSCPorter5, sdSSCPorter5, "Porter5 proteins", fix.empty.names = FALSE))
+colnames(df_3) <- c("SSclasses", "Frequency", "SD", "Group")
+```
+
+Now we plot the SSC of pos, neg and porter
+
+```{r}
+sscPlotSD <- ggplot(data=df_3, aes(x=SSclasses, y=Frequency, fill= Group)) +
+  geom_bar(stat="identity", position=position_dodge()) + scale_fill_manual(values=c('#e41a1c','#386cb0','#4daf4a')) + theme_ridges(font_size = 12,center_axis_labels = TRUE) + xlab("Secondary structure") + ylab("Mean frequency") + ggtitle("Secondary structure frequency for hemolytic, non-hemolytic and Porter5 proteins") + theme(plot.title = element_text(hjust = 0.5)) +
+  geom_errorbar(aes(ymin=Frequency-SD, ymax=Frequency+SD), width=.2,
+                 position=position_dodge(.9)) 
+sscPlotSD
+```
+
+One without SD
+
+```{r}
+sscPlot <- ggplot(data=df_3, aes(x=SSclasses, y=Frequency, fill= Group)) +
+  geom_bar(stat="identity", position=position_dodge()) + scale_fill_manual(values=c('#e41a1c','#386cb0','#4daf4a')) + theme_ridges(font_size = 12,center_axis_labels = TRUE) + xlab("Secondary structure") + ylab("Mean frequency") + ggtitle("Secondary structure frequency for hemolytic, \nnon-hemolytic and Porter5 proteins") + theme(plot.title = element_text(hjust = 0.5))
+sscPlot
+```
+
+Do the SSC groupd differ from each other? Again wilcoxon and ttest
+
+```{r}
+SS3_pos$Group <- "Hemolytic peptides"
+SS3_neg$Group <- "Non-hemolytic peptides"
+SSCPorter5 <- data.frame(SSCPorter5)
+SSCPorter5$Group <- "Swiss-Prot peptides"
+colnames(SSCPorter5) <- colnames(SS3_neg)
+dfSSCCombined <- rbind(SS3_pos, SS3_neg, SSCPorter5)
+
+# Is it normally distributed? (no), but also not symtrically distributed on both sides of the median...
+shapiro.test(sample(dfSSCCombined$Coil, 5000))
+shapiro.test(sample(dfSSCCombined$Sheet, 5000))
+
+# So to do test or wilcoxon? I dont know
+tTestComparisonSSC <- lapply(c("Coil", "Helix", "Sheet") ,tTestMultiple, dta = dfSSCCombined)
+names(tTestComparison) <- c("Coil", "Helix", "Sheet")
+
+wilcoxonComparisonSSC <- lapply(c("Coil", "Helix", "Sheet") ,wilcoxonMultiple, dta = dfSSCCombined)
+names(wilcoxonComparison) <- c("Coil", "Helix", "Sheet")
+
+tTestComparisonSSC[[1]] # this makes sense
+wilcoxonComparisonSSC[[1]] # This does not
+```
+
+Also, lets see if we can visualise the peptides based on AAC, DC, and SSC
+
+```{r}
+set.seed(123)
+# Store class
+Y <- as.character(datasetAAC$Hemolytic)
+sequences <- datasetAAC$Sequence
+# Split data
+# DC
+datasetDC <- as.matrix(datasetAAC[,31:430])
+# AAC + DC + SSC
+datasetAAC_DC_SSC <- as.matrix(datasetAAC[,8:430])
+# AAC
+datasetAAC <- as.matrix(datasetAAC[,AADict])
+
+datasetList <- lapply(list(datasetAAC, datasetDC, datasetAAC_DC_SSC), scale)
+# Run Umap on AAC, DC and AAC + DC + SSC
+umapList <- lapply(datasetList, umap)
+# Run TSNE on AAC, DC and AAC + DC + SSC
+tsneList <- lapply(datasetList, Rtsne, check_duplicates = FALSE)
+
+```
+
+Now that we have the UMAP and TSNE dimensionality reduction results we can use 
+the first two dims of each to create dot plots.
+
+```{r}
+# Plot Umap for AAC, DC and AAC + DC + SSC
+umapPlotList <- lapply(umapList, function(x) {
+  # Store in df
+  df <- data.frame(x = x[, 1], 
+                                  y = x[,2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot UMAP of peptides, colour by hemolytic class
+ggplot(df, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 1.3) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+  }
+)
+
+# Plot TSNE on AAC, DC and AAC + DC + SSC
+tsnePlotList <- lapply(tsneList, function(x) {
+  # Store in df
+  df <- data.frame(x = x[["Y"]][, 1], 
+                                  y = x[["Y"]][,2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot TSNE of peptides, colour by hemolytic class
+ggplot(df, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 1.3) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+  }
+)
+
+# plot the plots
+
+# UMAP
+for (i in 1:3){
+  plot(umapPlotList[[i]])
+}
+# TSNE
+for (i in 1:3){
+  plot(tsnePlotList[[i]])
+}
+```
+
+Lets continue with the AAC, DC, SSC of the TSNEvisualisation to see where in 
+TSNE different information on the peptide composition clusters
+
+```{r}
+# Store tsne of aac dc and ssc
+x <- tsneList[[3]]
+# create df with tsne 2 dims, hemo info
+df <- data.frame(x = x[["Y"]][, 1], y = x[["Y"]][,2], hemo = ifelse(Y == 1, "Hemolytic", "Non-hemolytic"),
+                  stringsAsFactors = FALSE)
+# add AAC, DC, SSC info
+df <- cbind(df, datasetAAC_DC_SSC)
+
+# plot AAC and SSC info on the TSNE, put it in a function so i dont have to
+# copy paste all the time
+plotPlots <- function() {
+plot(ggplot(df, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 1.3) + theme_void()  + 
+  scale_color_manual(values = c('#e41a1c', '#386cb0'), name = "Class") + 
+  ggtitle("Hemolytic and non-hemolytic peptides") +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+plot(ggplot(df, aes(x = x, y = y, color = Coil)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Coil") +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+plot(ggplot(df, aes(x = x, y = y, color = Helix)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Helix") +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+plot(ggplot(df, aes(x = x, y = y, color = Sheet)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Sheet") +
+  theme(plot.title = element_text(hjust = 0.5)))
+
+
+for (aa in AADict){
+  a <- ggplot(df, aes_string(x = "x", y = "y", color = aa)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D") + 
+  ggtitle(paste0("Amino acid: ", aa)) +
+  theme(plot.title = element_text(hjust = 0.5))
+  plot(a)
+}
+}
+
+plotPlots()
+```
+
+Lets put the Hemolytic class, Coil, Sheet, C, L and W in a nice plot for my
+thesis
+
+```{r}
+a1 <- ggplot(df, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 1.3) + theme_void()  + 
+  scale_color_manual(values = c('#e41a1c', '#386cb0'), name = "Class") + 
+  ggtitle("Hemolytic and non-hemolytic peptides") +
+  theme(plot.title = element_text(hjust = 0.5))
+a2 <- ggplot(df, aes(x = x, y = y, color = Coil)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Coil") +
+  theme(plot.title = element_text(hjust = 0.5))
+a3 <- ggplot(df, aes(x = x, y = y, color = Helix)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Helix") +
+  theme(plot.title = element_text(hjust = 0.5))
+a4 <- ggplot(df, aes(x = x, y = y, color = Sheet)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Sheet") +
+  theme(plot.title = element_text(hjust = 0.5))
+a5 <- ggplot(df, aes(x = x, y = y, color = L)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Leucine") +
+  theme(plot.title = element_text(hjust = 0.5))
+a6 <- ggplot(df, aes(x = x, y = y, color = K)) +
+  geom_point(size = 1.3) + theme_void() +
+  scale_color_viridis(option = "D")+ 
+  ggtitle("Lysine") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+ggarrange(a1,a2,a3,a4,a5,a6, labels = c("A", "B", "C", "D", "E", "F"), common.legend = F, legend = "right", ncol = 2, nrow = 3)
+```
+
+
+
+Maybe we can cluster the peptides? 
+Lets first scale and center the data
+
+```{r}
+scaledDatasetAAC_DC_SSC <- scale(datasetAAC_DC_SSC)
+```
+
+
+Lets try Kmeans clustering
+
+
+```{r}
+set.seed(2)
+# Kmeans clustering
+# Lets try for the AAC DC SSC data, because that is what worked best for the RF
+km5 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 5)
+km10 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 10)
+km15 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 15)
+km20 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 20)
+km25 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 25)
+km30 <- eclust(datasetList[[3]], FUNcluster = "kmeans", iter.max = 25, k = 30)
+# TSNE hemolytic
+ggplot(df, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 1.3) + theme_void()  + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+
+# KM clusters tsne plot
+ggplot(df, aes(x = x, y = y, color = as.factor(km5$cluster) )) +
+  geom_point(size = 1.3) + theme_void() 
+
+ggplot(df, aes(x = x, y = y, color = as.factor(km15$cluster) )) +
+  geom_point(size = 1.3) + theme_void()
+
+ggplot(df, aes(x = x, y = y, color = as.factor(km20$cluster) )) +
+  geom_point(size = 1.3) + theme_void()
+
+ggplot(df, aes(x = x, y = y, color = as.factor(km25$cluster) )) +
+  geom_point(size = 1.3) + theme_void()
+
+ggplot(df, aes(x = x, y = y, color = as.factor(km30$cluster) )) +
+  geom_point(size = 1.3) + theme_void()
+
+plotPlots()
+
+# Km with k = 10 and 15 does not even look that stupid, especially since cluster 3
+# seems to cluster on a high fraction of amino acid K
+# Seems to catch some meaning full clusters? K = 20 gets hard to see with these
+# colours.
+```
+
+We can try some methods to determine which K to use, elbow, silouette and gap
+
+```{r}
+# Elbow
+elbow <- fviz_nbclust(datasetAAC_DC_SSC, kmeans, method = "wss", k.max = 40, iter.max = 30)
+elbow
+# SIlhouetten
+sil <- fviz_nbclust(datasetAAC_DC_SSC, kmeans, method = "silhouette", k.max = 40, iter.max = 30)
+sil
+# Gap
+gap <- fviz_nbclust(datasetAAC_DC_SSC, kmeans, method = "gap_stat", k.max = 40, iter.max = 30)
+```
+
+They all give k = 2... I dont think I have the time and means to find biolgical
+meaningfull clusters from this
+Lets store some for my report
+```{r}
+# get some good colours
+# R colours brewer has a nice palette. I just combine all and then sample an n
+library(RColorBrewer)
+# Store colours
+qualCols = brewer.pal.info[brewer.pal.info$category == 'qual',]
+colVector = unlist(mapply(brewer.pal, qualCols$maxcolors, rownames(qualCols)))
+
+# k5 plot
+k5TSNE <- ggplot(df, aes(x = x, y = y, color = as.factor(km$km5) )) +
+  geom_point(size = 1.3) + theme_void() + 
+  ggtitle("Clustering with k = 5") +
+  theme(plot.title = element_text(hjust = 0.5)) + labs(color = "Clusters") + 
+  scale_color_manual(values = sample(colVector, 5))
+k5TSNE
+# k30 plot
+k30TSNE <- ggplot(df, aes(x = x, y = y, color = as.factor(km$km30) )) +
+  geom_point(size = 1.3) + theme_void() + 
+  ggtitle("Clustering with k = 30") +
+  theme(plot.title = element_text(hjust = 0.5)) + labs(color = "Clusters")+ 
+  scale_color_manual(values = sample(colVector, 30))
+k30TSNE
+
+# Arrange
+ggarrange(k5TSNE, k30TSNE, labels = c("A", "B"), common.legend = T, legend = "none", ncol = 2)
+# Save it because I did not set seed and these are nice.
+saveRDS(ggarrange(k5TSNE, k30TSNE, labels = c("A", "B"), common.legend = T, legend = "none", ncol = 2), "/home/jeppe/Dropbox/internship_TNO/Figures/Results/clustersk5k30.rds")
+```
+
+
+CDHIT clusters? I have 90-60 redundancy reduced and 90-60-40
+
+```{r}
+# Read cdhit results, start with 90 60
+cdhit90_60 <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/cdhit90-60/1600291656.fas.2-0.clstr.sorted")
+# clusters are marked by >Cluster, find where those cluster lines start
+clusters <- grep(">Cluster", cdhit90_60)
+# For each cluster we do:
+clustersList <- lapply(1:length(clusters), function(x){
+  # If it is the last cluster in the list
+  if (x == length(clusters)) {
+    # Store the peptides
+    vec <- cdhit90_60[clusters[x]:length(cdhit90_60)]
+  }
+  else{
+    # STore the peptides between >cluster x and >cluster y
+    y <- x + 1
+  vec <- cdhit90_60[clusters[x]:clusters[y]]
+  }
+})
+
+# Grep peptides per list entry, format is peptide_ and a number 1 to 4 times
+# Use str_extract, remove NA's
+clustersList <- lapply(1:length(clustersList), function(x){
+  peps <- na.omit(str_extract(clustersList[[x]], pattern = ">peptide_[0-9]{1,4}"))
+})
+
+# Read in our fasta
+fasta <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/sequences.fasta")
+
+# get the fasta headers
+sequenceNames <- fasta[c(TRUE,FALSE)]
+# and the sequences
+sequencesFasta <- fasta[c(FALSE,TRUE)]
+
+# Now the sequences in the fasta file are sorted differently then the sequences
+# from the database with peptide compositions (That we used for the TSNE). 
+# We need to sort the names thus like the sequences in the database with peptide 
+# compositions
+names(sequenceNames) <- sequencesFasta
+sequenceNames <- sequenceNames[as.character(sequences)]
+
+# Create df to add clusters to
+clustersCDHIT9060 <-  as.data.frame(sequenceNames)
+# Add a column for clusters, we had to remove sequences smaller then 5 in CD-HIT
+# so we add missing as standard annotation
+clustersCDHIT9060$Cluster <- "Missing"
+# Add per peptide what cluster they belong to
+for(x in 1:length(clustersList)) {
+  pepsInCluster <- clustersList[[x]] # Which peptides are in this cluster?
+  # For clusters, if there are more then 1 peptide in the cluster
+  if(length(pepsInCluster) >= 2){
+  # Add for each paptide which cluster they belong to
+  clustersCDHIT9060[as.character(clustersCDHIT9060$sequenceNames) %in% pepsInCluster, 2] <- paste0("Cluster_", x)}
+  else{
+  clustersCDHIT9060[as.character(clustersCDHIT9060$sequenceNames) %in% pepsInCluster, 2] <- "Singleton"} 
+  }
+
+# How many clusters (excluding singletons) are there anyway?
+length(unique(grep("Cluster", x = clustersCDHIT9060$Cluster, value = TRUE)))
+# 487
+
+# Show clusters on tsne
+ggplot(df, aes(x = x, y = y, color = clustersCDHIT9060$Cluster)) +
+  geom_point(size = 1.3) + theme_void() + theme(legend.position = "none") + 
+  ggtitle("CD-Hit clusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plotPlots()
+# Does seem to contain also some info? Red cluster, cluster on high L and high K?
+# Brown glob at the bottom is also the same as the red glob at the bottom of k = 15 above
+```
+
+Same for90 60 40 
+
+```{r}
+# Read cdhit results
+cdhit90_60_40 <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/cdhit90-60-40/1600291504.fas.3-0.clstr.sorted")
+# clusters are marked by >Cluster, find where those cluster lines start
+clusters <- grep(">Cluster", cdhit90_60_40)
+# For each cluster we do:
+clustersList <- lapply(1:length(clusters), function(x){
+  # If it is the last cluster in the list
+  if (x == length(clusters)) {
+    # Store the peptides
+    vec <- cdhit90_60_40[clusters[x]:length(cdhit90_60_40)]
+  }
+  else{
+    # STore the peptides between >cluster x and >cluster y
+    y <- x + 1
+  vec <- cdhit90_60_40[clusters[x]:clusters[y]]
+  }
+})
+
+# Grep peptides per list entry, format is peptide_ and a number 1 to 4 times
+# Use str_extract, remove NA's
+clustersList <- lapply(1:length(clustersList), function(x){
+  peps <- na.omit(str_extract(clustersList[[x]], pattern = ">peptide_[0-9]{1,4}"))
+})
+
+# Read in our fasta
+fasta <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/sequences.fasta")
+
+# get the fasta headers
+sequenceNames <- fasta[c(TRUE,FALSE)]
+# and the sequences
+sequencesFasta <- fasta[c(FALSE,TRUE)]
+
+# Now the sequences in the fasta file are sorted differently then the sequences
+# from the database with peptide compositions (That we used for the TSNE). 
+# We need to sort the names thus like the sequences in the database with peptide 
+# compositions
+names(sequenceNames) <- sequencesFasta
+sequenceNames <- sequenceNames[as.character(sequences)]
+
+# Create df to add clusters to
+clustersCDHIT906040 <-  as.data.frame(sequenceNames)
+# Add a column for clusters, we had to remove sequences smaller then 5 in CD-HIT
+# so we add missing as standard annotation
+clustersCDHIT906040$Cluster <- "Missing"
+# Add per peptide what cluster they belong to
+for(x in 1:length(clustersList)) {
+  pepsInCluster <- clustersList[[x]] # Which peptides are in this cluster?
+  # For clusters, if there are more then 1 peptide in the cluster
+  if(length(pepsInCluster) >= 2){
+  # Add for each paptide which cluster they belong to
+  clustersCDHIT906040[as.character(clustersCDHIT906040$sequenceNames) %in% pepsInCluster, 2] <- paste0("Cluster_", x)}
+  else{
+  clustersCDHIT906040[as.character(clustersCDHIT906040$sequenceNames) %in% pepsInCluster, 2] <- "Singleton"} 
+  }
+
+# How many clusters (excluding singletons) are there anyway?
+length(unique(grep("Cluster", x = clustersCDHIT906040$Cluster, value = TRUE)))
+# 200
+
+# Show clusters on tsne
+ggplot(df, aes(x = x, y = y, color = clustersCDHIT906040$Cluster)) +
+  geom_point(size = 1.3) + theme_void() + theme(legend.position = "none") + 
+  ggtitle("CD-Hit clusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plotPlots()
+```
+
+Store these clusters
+
+```{r}
+# Create DF
+clustersDF <- clustersCDHIT9060
+# Change colnames
+colnames(clustersDF) <- c("fastaName", "clustersCDHIT9060")
+# Store sequences as proper column
+clustersDF$Sequences <- rownames(clustersDF)
+
+# same for 90-60-40
+colnames(clustersCDHIT906040) <- c("fastaName", "clustersCDHIT906040")
+
+# join
+clustersDF <- inner_join(clustersDF, clustersCDHIT906040)
+# add KM clusters
+clustersDF$km5 <- km5$cluster
+clustersDF$km10 <- km10$cluster
+clustersDF$km15 <- km15$cluster
+clustersDF$km20 <- km20$cluster
+clustersDF$km25 <- km25$cluster
+clustersDF$km30 <- km30$cluster
+
+write.csv(clustersDF, "/home/jeppe/Dropbox/internship_TNO/R/6_AnalysesAndFigures/clustersPeptideComposition/clustersPeptideComp.csv")
+```
+

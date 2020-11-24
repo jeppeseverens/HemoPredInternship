@@ -1,0 +1,324 @@
+# Libraries
+```{r}
+library(reshape2)
+library(ggplot2)
+library(ggsci)
+library(dplyr)
+library(ComplexHeatmap)
+library(uwot)
+library(Rtsne)
+```
+
+Let's compare the results of our models on the test set
+
+```{r}
+# Import results
+cnn1H <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/1hSeqStruc2C1D_testSetPerformance.rds")
+cnnWord2Vec <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/CNN_testSetPerformanceWord2vec.rds")
+rfAAC <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_testSetPerformance.rds")
+svmAAC <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_testSetPerformance.rds")
+rfWord2Vec <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/RF_testSetPerformanceWord2vec.rds")
+```
+
+```{r}
+# Get results into df
+resultsDf <- data.frame(matrix(unlist(lapply(list(rfAAC, rfWord2Vec, svmAAC,cnn1H, cnnWord2Vec), function(testResult) {
+  mcc <- testResult[["MCC"]]
+  sens <- testResult[["byClass"]][["Sensitivity"]]
+  spec <- testResult[["byClass"]][["Specificity"]]
+  acc <- testResult[["overall"]][["Accuracy"]]
+  df <- c(mcc, sens, spec, acc)
+  return(df)
+})), nrow = 5, byrow = TRUE))
+# Add names and models
+colnames(resultsDf) <- c("MCC", "Sens", "Spec", "Acc")
+resultsDf$Models <- c("RF Peptide composition", "RF Summed Word2Vec repres.", "SVM Peptide composition", "CNN One-hot seq. & sec. struc.", "CNN Matrix of Word2Vec repres.")
+
+resultsDf
+
+# Melt
+resultsDf <- melt(resultsDf, id.vars = "Models")
+```
+
+```{r}
+# Plot
+p1 <- ggplot(resultsDf,
+       aes(
+         x = Models,
+         fill = variable
+       )) +
+  geom_bar(
+    aes(y = value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  ggtitle("Performance measures of final models on test set") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+# switch factor levels to order differently
+resultsDf$Models <- factor(resultsDf$Models, level = c("RF Peptide composition", "RF Summed Word2Vec repres.", "SVM Peptide composition", "CNN One-hot seq. & sec. struc.", "CNN Matrix of Word2Vec repres."))
+p2 <- ggplot(resultsDf, aes(x = variable, fill = Models)) +
+  geom_bar(aes(y = value),
+           colour = "black",
+           position = "dodge",
+           stat = "identity",
+           width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) + 
+  ggtitle("Performance measures of final models on test set") +
+  theme_minimal() +  theme(plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco() +
+  xlab("Performance measures")
+p2
+```
+
+Let's also check out which peptides get consistently classified correct or wrong
+
+```{r}
+# Get the sequences
+sequencesTest <- as.character(cnn1H[["predictionResults"]][["Sequences"]])
+# Df with classification results and sequences and hemolytic class
+classificationsTest <- data.frame(sequencesTest,
+           as.factor(cnn1H[["predictionResults"]][["Hemolytic"]]),
+           
+           rfAAC[["predictionResults"]][["PredictionCorrect"]],
+           rfWord2Vec[["predictionResults"]][["PredictionCorrect"]],
+           
+           svmAAC[["predictionResults"]][["PredictionCorrect"]],
+            
+           cnn1H[["predictionResults"]][["PredictionCorrect"]],
+           cnnWord2Vec[["predictionResults"]][["PredictionCorrect"]]
+           )
+# Add sensible names
+colnames(classificationsTest) <- c("Sequences", "Hemolytic", "RF Peptide comp.", "RF Word2Vec", "SVM Peptide comp.", "CNN One-hot", 
+                            "CNN Word2Vec")
+
+# Now we count for each peptide how many times it has been classified incorrectly
+# and we add this to our df
+classificationsTest$nIncorrect <- sapply(1:nrow(classificationsTest), function(x) {
+  nIncorrect <- table(classificationsTest[x,3:7] == "Incorrect")["TRUE"]
+  if (is.na(nIncorrect)){return(0)}
+  else{return(nIncorrect)}
+  })
+# Rearrange so we get a pretties heatmap
+classificationsTest <- classificationsTest %>% arrange(nIncorrect, Hemolytic)
+# Now we plot a heatmap of the prediction results
+Heatmap(as.matrix(classificationsTest[,3:7]), name = "Prediction", col = c("Correct" = "limegreen", "Incorrect" = "red"), row_split = classificationsTest$nIncorrect, column_split = c(" ","  ","   ","    ","     "), column_names_rot = 45, column_names_centered = T, column_title = "Heatmap of the model predictions of the test set", raster_quality = 100) +
+# and as extra visualisation we add a heatmap of the prediction results
+Heatmap(as.matrix(classificationsTest[,2]), name = "Hemolytic", col = c("1" = '#e41a1c', "0" = "#386cb0"), width = unit(0.5, "cm"),raster_quality = 100)
+```
+
+For the misclassified peptides, how many are hemolytic and how many are nonhemolytic
+
+```{r}
+# First for the RF peptide composition prediction, since this was the best one
+rfWrongPred <- classificationsTest[,2:3]
+
+nHemo <- length(which(rfWrongPred$Hemolytic == 1))
+nNonHemo <- length(which(rfWrongPred$Hemolytic == 0))
+cat("Percentage of hemolytic in test\n")
+nHemo/nrow(rfWrongPred) * 100
+cat("\nPercentage of Non hemolytic in test\n")
+nNonHemo/nrow(rfWrongPred) * 100
+
+nHemoCorrect <- length(which(rfWrongPred[which(rfWrongPred$Hemolytic == 1),2] == "Correct"))
+nHemoInorrect <- length(which(rfWrongPred[which(rfWrongPred$Hemolytic == 1),2] == "Incorrect"))
+
+cat("\nPercentage of correct predicted hemolytic peptides in test\n")
+nHemoCorrect/nHemo * 100
+cat("\nPercentage of incorrect predicted hemolytic peptides in test\n")
+nHemoInorrect/nHemo * 100
+
+nNonhemoCorrect <- length(which(rfWrongPred[which(rfWrongPred$Hemolytic == 0),2] == "Correct"))
+nNonhemoIncorrect <- length(which(rfWrongPred[which(rfWrongPred$Hemolytic == 0),2] == "Incorrect"))
+
+cat("\nPercentage of correct predicted hemolytic peptides in test\n")
+nNonhemoCorrect/nNonHemo * 100
+cat("\nPercentage of incorrect predicted hemolytic peptides in test\n")
+nNonhemoIncorrect/nNonHemo * 100
+
+# This is also obvious from the difference between sensitivity and specificity
+```
+
+```{r}
+# now for the SVM which was the worst
+svmWrongPred <- classificationsTest[,c(2,5)]
+
+nHemo <- length(which(svmWrongPred$Hemolytic == 1))
+nNonHemo <- length(which(svmWrongPred$Hemolytic == 0))
+cat("Percentage of hemolytic in test\n")
+nHemo/nrow(svmWrongPred) * 100
+cat("\nPercentage of Non hemolytic in test\n")
+nNonHemo/nrow(svmWrongPred) * 100
+
+nHemoCorrect <- length(which(svmWrongPred[which(svmWrongPred$Hemolytic == 1),2] == "Correct"))
+nHemoInorrect <- length(which(svmWrongPred[which(svmWrongPred$Hemolytic == 1),2] == "Incorrect"))
+
+cat("\nPercentage of correct predicted hemolytic peptides in test\n")
+nHemoCorrect/nHemo * 100
+cat("\nPercentage of incorrect predicted hemolytic peptides in test\n")
+nHemoInorrect/nHemo * 100
+
+nNonhemoCorrect <- length(which(svmWrongPred[which(svmWrongPred$Hemolytic == 0),2] == "Correct"))
+nNonhemoIncorrect <- length(which(svmWrongPred[which(svmWrongPred$Hemolytic == 0),2] == "Incorrect"))
+
+cat("\nPercentage of correct predicted hemolytic peptides in test\n")
+nNonhemoCorrect/nNonHemo * 100
+cat("\nPercentage of incorrect predicted hemolytic peptides in test\n")
+nNonhemoIncorrect/nNonHemo * 100
+
+# This is also obvious from the difference between sensitivity and specificity
+```
+
+Let's see if we can analyse our wrongly predicted peptides with some clustering  
+
+```{r}
+# Resort alphabetically
+classificationsTest <- classificationsTest %>% arrange(Sequences)
+# STore hemo data
+Y <- classificationsTest$Hemolytic
+# Import clusters, also sort alphabetically so we are sure info matches
+clusterDf <- read.csv("/home/jeppe/Dropbox/internship_TNO/R/7_AnalysesAndFigures/clustersPeptideComposition/clustersPeptideComp.csv")
+clusterDf$X <- NULL
+clusterDf <- clusterDf %>% arrange(Sequences)
+
+# Add cluster info
+classificationsTest <- inner_join(classificationsTest, clusterDf, by = "Sequences")
+```
+
+Are there clusters which contain more wrong predicted peptides? First for all models
+
+```{r}
+# Use aggregrate to get a summery statistic per subset. We split the wrong prediction
+# by cluster and we get a mean of how many peptides were wrongly predicted in that cluster
+# arrange desc. to see which group has the most wrong predicted
+# Kmean clusters
+
+# K = 10 
+aggregate(classificationsTest[c(8)], list(classificationsTest$km10), mean) %>% arrange(desc(nIncorrect))
+# K = 15
+aggregate(classificationsTest[c(8)], list(classificationsTest$km15), mean)%>% arrange(desc(nIncorrect))
+# K = 20 
+aggregate(classificationsTest[c(8)], list(classificationsTest$km20), mean)%>% arrange(desc(nIncorrect))
+# K = 25
+aggregate(classificationsTest[c(8)], list(classificationsTest$km25), mean)%>% arrange(desc(nIncorrect))
+# K = 30
+aggregate(classificationsTest[c(8)], list(classificationsTest$km30), mean)%>% arrange(desc(nIncorrect))
+```
+
+Same but for the CD-hit clusters
+```{r}
+# For the CDHIT clusters, first we find which cluster occur more than n times in the
+# test set. Then we find which rows contain these clusers. WE only aggregrate for
+# those rows so we dont end up with the very small clusters.
+# 90,60
+keep <- names(which((table(classificationsTest$clustersCDHIT9060) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT9060 %in% keep
+aggregate(classificationsTest[keep,c(8)], list(classificationsTest[keep,10]), mean) %>% arrange(desc(x))
+
+# 90,60,40
+keep <- names(which((table(classificationsTest$clustersCDHIT906040) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT906040 %in% keep
+aggregate(classificationsTest[keep,c(8)], list(classificationsTest[keep,11]), mean) %>% arrange(desc(x))
+```
+
+Lets extract the sequence clusters which were classified 50% or more wrong by all models
+
+```{r}
+#rerun
+keep <- names(which((table(classificationsTest$clustersCDHIT9060) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT9060 %in% keep
+# Store
+CDHIT906040_rankingAll <- aggregate(classificationsTest[keep,c(8)], list(classificationsTest[keep,10]), mean) %>% arrange(desc(x))
+# Which have 50% or more wrong classifications
+keep <- classificationsTest$clustersCDHIT9060 %in% as.character(CDHIT906040_rankingAll[CDHIT906040_rankingAll$x >= 3,1])
+classificationsTest[keep, c(1,10)] %>% arrange(desc(clustersCDHIT9060))
+```
+
+
+Now for the rf model only
+
+```{r}
+# Use aggregrate to get a summery statistic per subset. We split the wrong prediction
+# by cluster and we get a mean of how many peptides were wrongly predicted in that cluster
+# arrange desc. to see which group has the most wrong predicted
+# Kmean clusters
+
+# Which were wrongly predicted by the RF + pep comp model?
+rfPepCompPred <- ifelse(classificationsTest[c(3)] == "Correct", 0, 1)
+colnames(rfPepCompPred) <- "x"
+# K = 10 
+aggregate(rfPepCompPred, list(classificationsTest$km10), mean) %>% arrange(desc(x))
+# K = 15
+aggregate(rfPepCompPred, list(classificationsTest$km15), mean)%>% arrange(desc(x))
+# K = 20 
+aggregate(rfPepCompPred, list(classificationsTest$km20), mean)%>% arrange(desc(x))
+# K = 25
+aggregate(rfPepCompPred, list(classificationsTest$km25), mean)%>% arrange(desc(x))
+# K = 30
+aggregate(rfPepCompPred, list(classificationsTest$km30), mean)%>% arrange(desc(x))
+```
+
+Same but for the CD-hit clusters
+```{r}
+# For the CDHIT clusters, first we find which cluster occur more than n times in the
+# test set. Then we find which rows contain these clusers. WE only aggregrate for
+# those rows so we dont end up with the very small clusters.
+# 90,60
+keep <- names(which((table(classificationsTest$clustersCDHIT9060) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT9060 %in% keep
+aggregate(rfPepCompPred[keep], list(classificationsTest[keep,10]), mean) %>% arrange(desc(x))
+
+# 90,60,40
+keep <- names(which((table(classificationsTest$clustersCDHIT906040) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT906040 %in% keep
+aggregate(rfPepCompPred[keep], list(classificationsTest[keep,11]), mean) %>% arrange(desc(x))
+```
+
+Lets extract the sequence clusters which were classified 50% or more wrong by the RF 
++ peptide composition model.
+
+```{r}
+# rerun
+keep <- names(which((table(classificationsTest$clustersCDHIT9060) > 2) == TRUE))
+keep <- classificationsTest$clustersCDHIT9060 %in% keep
+# Store
+CDHIT906040_ranking <- aggregate(rfPepCompPred[keep], list(classificationsTest[keep,10]), mean) %>% arrange(desc(x))
+# Which have 50% or more wrong classifications
+keep <- classificationsTest$clustersCDHIT9060 %in% as.character(CDHIT906040_ranking[CDHIT906040_ranking$x >= 0.5,1])
+
+# THIS TABLE IS IN THE REPORT!  
+dfWithSequences50percWrong <- classificationsTest[keep, c(1:3,10)] %>% arrange(desc(clustersCDHIT9060))
+dfWithSequences50percWrong
+```
+
+```{r}
+datasetAAC[datasetAAC$Sequence %in% as.character(dfWithSequences50percWrong$Sequences),]
+```
+
+I dont really know how to put this in the report? Big Table?
+
+Also, to find motifs in the incorrectly predicted peptides you could run them through
+MEME, which allows to compare motifs and do differential expression.
+
+http://meme-suite.org/

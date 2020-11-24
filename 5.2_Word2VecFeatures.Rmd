@@ -1,0 +1,412 @@
+
+# Deep neural network and peptides encoded as vectors
+
+Here we are going to use the feature representations that word2vec learned
+to create feature representations for our peptides. Then we will use these to 
+train a deep neural network (DNN) and ofcourse test on our test set.
+
+# Libraries
+```{r}
+library(stringr)
+library(parallel)
+library(doParallel)
+library(word2vec)
+library(Matrix)
+```
+
+Read in our word2vec representations for 1-grams and 2grams.
+For both n-grams there are 18 representations, quite a lot
+
+```{r}
+# 1 gram, get all files and lapply to read them in, get words embeddings and remove
+# the stop sign we do not need.
+filesSentences1gram <- list.files("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/", "sentences1Gram", full.names = TRUE)
+modelSentences1gram <- lapply(filesSentences1gram, read.word2vec)
+modelSentences1gram <- lapply(modelSentences1gram, as.matrix)
+modelSentences1gram <- lapply(modelSentences1gram, function(x) x[-which(rownames(x) == "</s>"),])
+
+# Same for 2 gram
+filesSentences2gram <- list.files("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/", "sentences2gram", full.names = TRUE)
+modelSentences2gram <- lapply(filesSentences2gram, read.word2vec)
+modelSentences2gram <- lapply(modelSentences2gram, as.matrix)
+modelSentences2gram <- lapply(modelSentences2gram, function(x) x[-which(rownames(x) == "</s>"),])
+
+# And we add names to the lists for clarity reasons
+listNames <- lapply(list(filesSentences1gram, filesSentences2gram), gsub, pattern = "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/", replacement = "")
+names(modelSentences1gram) <- listNames[[1]]
+names(modelSentences2gram) <- listNames[[2]]
+```
+
+Now we will import our dataset of the hemolytic/non-hemolytic peptides and their
+n-grams
+
+```{r}
+# Dataset of hemolytic and non hemolytic peptides, only need sequence and hemolytic info
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/sentencesHemoDataset.csv")
+```
+
+Now we need to get for our sequences and secondary structure, the numeric feature
+representation. There are two things we can do; 
+1) people have succesfully summedall the vectors for each n-gram in the sequence 
+to be used for DNN, RF, SVM etc. You get one vector per peptide
+
+2) people have created a matrix of all the vectors for each n-gram for the sequence
+to be used for CNN. You get a matrix of vectors per amino acid position for each
+peptide
+
+First let's sum the 300 dim representations for the 1-gram
+
+First we make a function that find which and how many 1-grams are in a 
+sequence+secondary structure sentence. 
+
+```{r}
+# Now for all four 300 representations we have for 1-grams
+# we run this:
+
+# Which representations are the 300 dims?
+models300Dims1Grams<- grep("300", names(modelSentences1gram))
+
+sentencesAsSums1gram <- lapply(models300Dims1Grams, function(x) {
+  # For all the rows in our dataset (all our peptides)
+  sentencesAsSums1gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 1-grams
+      splitString <-
+        unlist(str_split(dataset$Sentences1gram[y], pattern = " "))
+      # Which vectors match these 1-grams
+      vectors <- modelSentences1gram[[x]][splitString, ]
+      # Sum all these vectors to get our vector for 1 peptide
+      sentenceFeature <- colSums(vectors)
+      # Add our sequence
+      sentenceFeature[length(sentenceFeature) + 1] <-
+        as.character(dataset$Sequence[y])
+      # Add hemolytic class
+      sentenceFeature[length(sentenceFeature) + 1] <-
+        dataset$Hemolytic[y]
+      return(sentenceFeature)
+    }, mc.cores = 6)
+
+  # Create df from list
+  sentencesAsSums1gram <- do.call(rbind.data.frame, c(sentencesAsSums1gram, stringsAsFactors=FALSE))
+  # This makes everything into characters, we want numeric for our vector
+  # thus we lapply as numeric
+  sentencesAsSums1gram[,1:ncol(modelSentences1gram[[x]])] <- data.frame(lapply(sentencesAsSums1gram[,1:ncol(modelSentences1gram[[x]])],as.numeric))
+  # Change the colnames so they make sense
+  colnames(sentencesAsSums1gram) <- c(seq(from = 1, to = ncol(modelSentences1gram[[x]])), "Sequence", "Hemolytic")
+  
+  return(sentencesAsSums1gram)
+})
+
+# Create names for our lists
+names(sentencesAsSums1gram) <-
+  c(
+    "word2vecFeaturesCombined1GramDim300W5",
+    "word2vecFeaturesCombined1GramDim300W15",
+    "word2vecFeaturesCombined1GramDim300W25",
+    "word2vecFeaturesHemo1GramDim300W5",
+    "word2vecFeaturesHemo1GramDim300W15",
+    "word2vecFeaturesHemo1GramDim300W25","
+    word2vecFeaturessPorter1GramDim300W5",
+    "word2vecFeaturesPorter1GramDim300W15",
+    "word2vecFeaturesPorter1GramDim300W25"
+  )
+
+cat("Now our sequence:\n")
+as.character(sentencesAsSums1gram[[1]][1,301])
+cat("Looks like this")
+as.matrix(sentencesAsSums1gram[[1]][1,1:300])
+# Store our 1-gram feature representations
+saveRDS(sentencesAsSums1gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed1gram.rds")
+```
+
+And now for the 100 dims, we will create matrices per peptide,
+with for every position the matching numeric feature representation.
+
+Example peptide: A_sheet, A_coil, K_coil
+Matrix: 
+       v1   v2  v4  v4    v5
+A_sheet 23, 45, 211, 66, -123
+A_coil 344, 235, -.1, -1, 39
+K_coil 13,  -9,  83,  7, -83
+
+
+```{r}
+# Now for our 100 dim representations we have for 1-grams
+models100Dims1Grams<- grep("100", names(modelSentences1gram))
+
+# We run this. Output will be matrices of feature representation
+sentencesAsMatrices1gram <- lapply(models100Dims1Grams, function(x) {
+  # For all the rows in our dataset (all our peptides)
+  sentencesAsMatrices1gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 1-grams
+      splitString <-
+        unlist(str_split(dataset$Sentences1gram[y], pattern = " "))
+      # Create empty zero matrix to zero pad sentences shorter than 133 aminoacids
+      # We use Matrix to make sparse matrices which use a lot less memory
+      vectors <- Matrix(0, nrow = 133, ncol = ncol(modelSentences1gram[[x]]), sparse = TRUE)
+      # Paste in our vectors
+      vectors[1:length(splitString),] <-
+        as.matrix(modelSentences1gram[[x]][splitString, ])
+      # Empty list to add our matrix to and add meta info
+      tempList <- list()
+      # add matrix and add Hemolytic and Sequence info
+      tempList$word2vecMatrix <- vectors
+      tempList$Sequence <- as.character(dataset$Sequence)[y]
+      tempList$Hemolytic <- dataset$Hemolytic[y]
+      
+      return(tempList)
+    }, mc.cores = 2)
+}
+)
+
+# Name our lists
+names(sentencesAsMatrices1gram) <-
+  c(
+    "word2vecFeaturesCombined1GramDim100W5",
+    "word2vecFeaturesCombined1GramDim100W15",
+    "word2vecFeaturesCombined1GramDim100W25",
+    "word2vecFeaturesHemo1GramDim100W5",
+    "word2vecFeaturesHemo1GramDim100W15",
+    "word2vecFeaturesHemo1GramDim100W25","
+    word2vecFeaturessPorter1GramDim100W5",
+    "word2vecFeaturesPorter1GramDim100W15",
+    "word2vecFeaturesPorter1GramDim100W25"
+  )
+
+# Store our 1-gram feature representations in matrix form
+saveRDS(sentencesAsMatrices1gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix1gram.rds")
+```
+
+Now for the 2grams. We cannot use the Porter5 data because not every 2gram that
+is in our hemo data was found in the Porter5 dataset. This is a bit weird but not
+impossible, although still a discussion point.
+
+```{r}
+# We need vector for these
+hemo2grams <- unique(unlist(str_split(dataset$Sentences2gram, " ")))
+# We have these
+porter5_2grams <- rownames(modelSentences2gram[[18]])
+
+# These are missing
+cat("Missing 2grams\n")
+hemo2grams[!(hemo2grams %in% porter5_2grams)]
+
+# And these peptides are the "culprits"
+cat("\n\nPeptides which 2-grams are missing\n")
+as.character(dataset$Sequence)[grep(paste0(hemo2grams[!(hemo2grams %in% porter5_2grams)], collapse = "|"), x = dataset$Sentences2gram)]
+```
+
+Now for the representations based on only the hemo peptides and combined peptides we
+can continue.
+
+```{r}
+# Now for all 300 dim hemo peptides and combined peptides representations we have for 2-grams
+
+models300Dims2Grams<- grep("CombinedDim300|HemoDim300", names(modelSentences2gram))
+
+# we run this:
+sentencesAsSums2gram <- lapply(models300Dims2Grams, function(x) {
+  # For all the rows in our dataset (all our peptides)
+  sentencesAsSums2gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 2-grams
+      splitString <-
+        unlist(str_split(dataset$Sentences2gram[y], pattern = " "))
+      # Which vectors match these 2-grams
+      vectors <- modelSentences2gram[[x]][splitString, ]
+      # Sum all these vectors to get our vector for 1 peptide
+      sentenceFeature <- colSums(vectors)
+      # Add our sequence
+      sentenceFeature[length(sentenceFeature) + 1] <-
+        as.character(dataset$Sequence[y])
+      # Add hemolytic class
+      sentenceFeature[length(sentenceFeature) + 1] <-
+        dataset$Hemolytic[y]
+      return(sentenceFeature)
+    }, mc.cores = 6)
+
+
+  # Create df from list
+  sentencesAsSums2gram <- do.call(rbind.data.frame, c(sentencesAsSums2gram, stringsAsFactors=FALSE))
+  # This makes everything into characters, we want numeric for our vector
+  # thus we lapply as numeric
+  sentencesAsSums2gram[,1:ncol(modelSentences2gram[[x]])] <- data.frame(lapply(sentencesAsSums2gram[,1:ncol(modelSentences2gram[[x]])],as.numeric))
+  # Change the colnames so they make sense
+  colnames(sentencesAsSums2gram) <- c(seq(from = 1, to = ncol(modelSentences2gram[[x]])), "Sequence", "Hemolytic")
+  
+  return(sentencesAsSums2gram)
+})
+
+# Create names for our lists
+names(sentencesAsSums2gram) <-
+  c(
+    "word2vecFeaturesCombined2GramDim300W5",
+    "word2vecFeaturesCombined2GramDim300W15",
+    "word2vecFeaturesCombined2GramDim300W25",
+    "word2vecFeaturesHemo2GramDim300W5",
+    "word2vecFeaturesHemo2GramDim300W15",
+    "word2vecFeaturesHemo2GramDim300W25")
+
+# Store our 2-gram feature representations
+saveRDS(sentencesAsSums2gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed2gram.rds")
+```
+
+Same for the 100 dims to a matrix
+
+```{r}
+# Now for our 100 dim representations we have for 2-grams, without the porter5
+# learned representations
+models100Dims2Grams<- grep("CombinedDim100|HemoDim100", names(modelSentences2gram))
+
+# Maximum rows we need for our matrices. We need one row per 2-gram, which
+# sentence has the most 2-grams and how many? (of course it is 133-1)
+maxLength2Grams <- max(unlist(lapply(str_split(dataset$Sentences2gram, pattern = " "), length)))
+```
+
+```{r}
+# We run this. Output will be matrices of feature representation
+sentencesAsMatrices2Gram <- lapply(models100Dims2Grams, function(x) {
+  # For all the rows in our dataset (all our peptides)
+  sentencesAsMatrices2Gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 1-grams
+      splitString <-
+        unlist(str_split(dataset$Sentences2gram[y], pattern = " "))
+      # Create empty zero matrix to zero pad sentences shorter than the max
+      # length of 2-gram sentences we have
+      # We use Matrix to make sparse matrices which use a lot less memory
+      vectors <- Matrix(0, nrow = maxLength2Grams, ncol = ncol(modelSentences2gram[[x]]), sparse = TRUE)
+      # Paste in our vectors
+      vectors[1:length(splitString),] <-
+        as.matrix(modelSentences2gram[[x]][splitString, ])
+      # Empty list to add our matrix to and add meta info
+      tempList <- list()
+      # add matrix and add Hemolytic and Sequence info
+      tempList$word2vecMatrix <- vectors
+      tempList$Sequence <- as.character(dataset$Sequence)[y]
+      tempList$Hemolytic <- dataset$Hemolytic[y]
+      
+      return(tempList)
+    }, mc.cores = 6)
+}
+)
+
+# Name our lists
+names(sentencesAsMatrices2Gram) <-
+  c(
+    "word2vecFeaturesCombined2GramDim100W5",
+    "word2vecFeaturesCombined2GramDim100W15",
+    "word2vecFeaturesCombined2GramDim100W25",
+    "word2vecFeaturesHemo2GramDim100W5",
+    "word2vecFeaturesHemo2GramDim100W15",
+    "word2vecFeaturesHemo2GramDim100W25"
+  )
+
+# Store our 2-gram feature representations in matrix form
+saveRDS(sentencesAsMatrices2Gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix2Gram.rds")
+```
+
+Now for our comparison vector of just the amino acids
+
+First the one I have downloaded from 
+https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0141287
+These are trained on all sequences in SwissProt
+
+And secondly the 100 and 300 dim ones I got from our hemolytic/non-hemo peptides
+
+```{r}
+# Read in the vector per 3-gram of amino acids for the pretrained model I dowloaded
+# Note that the amount of rows is bigger then 8000,because amino acids
+# other than the 20 standard ones were included
+protVec<- as.matrix(read.csv("file:///home/jeppe/Dropbox/internship_TNO/R/Word2Vec/protVec_100d_3grams.csv", sep = "\t", row.names = "words"))
+
+# Read in the vectors for the models I trained myself on the 3-grams of 
+# amino acids of the hemo/non-hemo pepts
+hemoVec100 <- as.matrix(read.word2vec("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/modelHemoSequence3gram100Dim.bin"))
+hemoVec300 <- as.matrix(read.word2vec("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/modelHemoSequence3gram300Dim.bin"))
+
+# And the dataset of our sequences of hemo/non-hemo as 3-grams
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/R/Word2Vec/sequences3GramHemoDataset.csv")
+```
+
+Now get the summer vector representations per peptide baes on 3 grams of their
+amino acids
+
+```{r}
+sequencesAsSums3gram <- lapply(list(protVec, hemoVec300), function(x){
+sequencesAsSums3gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 3-grams
+      splitString <-
+        unlist(str_split(dataset$Sequences3gram[y], pattern = " "))
+      # Which vectors match these 3-grams
+      vectors <- x[splitString, ]
+      # Sum all these vectors to get our vector for 1 peptide
+      sequenceFeature <- colSums(vectors)
+      # Add our sequence
+      sequenceFeature[length(sequenceFeature) + 1] <-
+        as.character(dataset$Sequence[y])
+      # Add hemolytic class
+      sequenceFeature[length(sequenceFeature) + 1] <-
+        dataset$Hemolytic[y]
+      return(sequenceFeature)
+    }, mc.cores = 6)
+
+
+  # Create df from list
+  sequencesAsSums3gram <- do.call(rbind.data.frame, c(sequencesAsSums3gram, stringsAsFactors=FALSE))
+  # This makes everything into characters, we want numeric for our vector
+  # thus we lapply as numeric
+  sequencesAsSums3gram[,1:(ncol(sequencesAsSums3gram)-2)] <- data.frame(lapply(sequencesAsSums3gram[,1:(ncol(sequencesAsSums3gram)-2)],as.numeric))
+  # Change the colnames so they make sense
+  colnames(sequencesAsSums3gram) <- c(seq(from = 1, to = ncol(x)), "Sequence", "Hemolytic")
+  return(sequencesAsSums3gram)
+})
+names(sequencesAsSums3gram) <- c("sequences3gramsProtVec","sequences3gramsHemopeps")
+
+# And store
+saveRDS(sequencesAsSums3gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSums3GramsAAComparison.rds")
+```
+
+And the matrix representations per peptide based on 3-grams of their amino acids
+
+```{r}
+# Max nrows for our matrices
+maxLength3Grams <- max(unlist(lapply(str_split(dataset$Sequences3gram, pattern = " "), length)))
+
+# Get matrices
+sequencesAsMatrices3Gram <- lapply(list(protVec, hemoVec100), function(x) {
+  # For all the rows in our dataset (all our peptides)
+  sequencesAsMatrices3Gram <-
+    mclapply(1:nrow(dataset), function(y) {
+      # String spit into the 1-grams
+      splitString <-
+        unlist(str_split(dataset$Sequences3gram[y], pattern = " "))
+      # Create empty zero matrix to zero pad sequences shorter than the max
+      # length of 2-gram sequences we have
+      # We use Matrix to make sparse matrices which use a lot less memory
+      vectors <- Matrix(0, nrow = maxLength3Grams, ncol = ncol(x), sparse = TRUE)
+      # Paste in our vectors
+      vectors[1:length(splitString),] <-
+        as.matrix(x[splitString, ])
+      # Empty list to add our matrix to and add meta info
+      tempList <- list()
+      # add matrix and add Hemolytic and Sequence info
+      tempList$word2vecMatrix <- vectors
+      tempList$Sequence <- as.character(dataset$Sequence)[y]
+      tempList$Hemolytic <- dataset$Hemolytic[y]
+      
+      return(tempList)
+    }, mc.cores = 6)
+}
+)
+
+# Name our lists
+names(sequencesAsMatrices3Gram) <-
+  c("sequences3gramsProtVec","sequences3gramsHemopeps")
+
+# And store
+saveRDS(sequencesAsMatrices3Gram, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix3GramsAAComparison.rds")
+```
+

@@ -1,0 +1,268 @@
+
+# Hemolytic activy classification with word2vec features, 1 gram
+
+We have our peptides represented by numerical features that word2vec generated
+Now we can try to use them in a neural network. I have to chosen to use a RF
+for the summer vectors, but of course a DNN, SVM etc would also be possible
+
+# Libraries
+```{r}
+library(dplyr)
+library(ranger)
+library(caret)
+library(parallel)
+library(doParallel)
+```
+
+Get our train/test sets with the summed vectors as features for the peptides
+We have the features based on the 1 grams and 2 grams of structure + sequence info
+and as a control we have the 3 grams from only the amino acids. I have chosen to
+only test the window 5 and window 25 variants, leaving the window 15 out. 
+Else I am afraid my laptop will catch on fire soon before finishing this intership 
+
+# Create train/test sets
+
+```{r}
+# Import our datasets
+datasetList_1 <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed1gram.rds")
+datasetList_2 <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed2gram.rds")
+datasetList_3 <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSums3GramsAAComparison.rds")
+
+# Merge lists
+datasetList <- c(datasetList_1, datasetList_2, datasetList_3)
+# Take only the window 5 and 25 variants of word2vec based features
+datasetList <- datasetList[c(1,3,4,6,7,9,10,12,13,15,16,17)]
+rm(datasetList_1, datasetList_2, datasetList_3)
+# train and test sequences
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+
+# Split in train_x and test_x
+# We find which sequences in the dataset are in the train sequences, take these
+# and only take columns 1:300 or 1:100 because 301 or 101 is Sequence and 302 or
+# 102 is Hemolytic class
+# Lapply so we can do it for all feature sets
+# We only need train for now, test only for final model
+
+train_xList <- lapply(1:length(datasetList), function(x) datasetList[[x]][datasetList[[x]][,ncol(datasetList[[x]])-1] %in% trainTest[["train"]],1:(ncol(datasetList[[x]])-2)])
+
+# Add sensible names so we know what features are in which list
+names(train_xList) <- names(datasetList)
+
+# Same for y, but now we only take column 302 because this has the class info
+# and y is the same for all so we only need one. Needs to be numeric
+train_y <- as.numeric(datasetList[[1]][datasetList[[1]][,ncol(datasetList[[1]])-1] %in% trainTest[["train"]],ncol(datasetList[[1]])])
+
+train_weights <- ifelse(train_y == 1,
+                        (1/table(train_y)[2]) * 0.5,
+                        (1/table(train_y)[1]) * 0.5)
+```
+
+
+```{r}
+# Data is our input data that caret created, this is the format it expects, the 
+# other variables we don;t use but need to establish = NULL
+MySummary  <- function(data, lev = NULL, model = NULL){
+  a1 <- defaultSummary(data, lev, model) # Accuracy, Kappa
+  b1 <- twoClassSummary(data, lev, model)  # ROC, sens., spec.
+  c1 <- prSummary(data, lev, model)  # Auc, Prec, recall, f1
+  d1 <- mlr3measures::mcc(data[, "obs"], data[, "pred"], positive = "X1")  # MCC
+  names(d1) <- "mcc"  # MCC
+  out <- c(a1, b1, c1, d1)  # Combine
+  out}
+```
+
+Now for every possible feature set we train a RF model with 10-fold cv to determine
+performance measures and intra model stability (SD)
+
+```{r}
+# Parallellise
+cl <- makeCluster(6) 
+registerDoParallel(cl)
+
+# For each feature format in our list of train_X, we run:
+lapply(1:length(train_xList), function(x) {
+# Create grid of hyperparameters to walk through
+tgrid <- expand.grid(.mtry = 10:30, .splitrule = "gini", .min.node.size = 1:9)
+# Down sample so we have to do less
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+# Run our model
+
+modelRF_temp <- train(x = train_xList[[x]], y = as.factor(train_y),
+                        method = "ranger", # RF from ranger package
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+# Store results in the loop and
+# add which features we used
+modelRF_temp$features <- names(train_xList[x])
+  saveRDS(modelRF_temp,paste0("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/RF_models/RF_model", names(train_xList[x]), ".rds"))
+# Just to show you it is progressing
+  print(paste0("Run", names(train_xList[x]), " done"))
+}
+)
+stopCluster(cl)
+```
+
+After this is done, we can check out the results. We list the results filed, 
+read them in and find which one had the highest MCC per feature. For each feature
+format the model with the highest MCC we also check out the other performance 
+measure results. 
+
+```{r}
+#List files and read them in, add normal names
+results <- list.files("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/rf_models/", pattern = ".rds", full.names = TRUE)
+results <- lapply(results, function(x) readRDS(x))
+names(results) <- list.files("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/rf_models/", pattern = ".rds", full.names = FALSE)
+
+# Get a list with out performance measures per feature format, for the model
+# with highest MCC
+resultsList <- lapply(1:length(results), function(i){
+  best <- which(max(results[[i]][["results"]][["mcc"]]) == results[[i]][["results"]][["mcc"]])
+  df <- t(data.frame(c(
+    results[[i]][["features"]],
+    results[[i]][["results"]][["mcc"]][best], 
+    results[[i]][["results"]][["mccSD"]][best],
+    results[[i]][["results"]][["Sens"]][best],
+    results[[i]][["results"]][["SensSD"]][best],
+    results[[i]][["results"]][["Spec"]][best],
+    results[[i]][["results"]][["SpecSD"]][best],
+    results[[i]][["results"]][["Accuracy"]][best],
+    results[[i]][["results"]][["AccuracySD"]][best],
+    results[[i]][["results"]][["mtry"]][best],
+    results[[i]][["results"]][["min.node.size"]][best]
+    )))
+  rownames(df) <- NULL
+  return(df)
+})
+# Put into df so we can scroll through it
+resultsDf <-
+  data.frame(matrix(
+    unlist(resultsList),
+    nrow = length(resultsList),
+    byrow = T
+  ), stringsAsFactors = FALSE)
+# Add sensible names
+colnames(resultsDf) <- c("Features", "MCC", "MCC_SD", "Sens", "SensSD", "Spec", "SpecSD", "Acc", "AccSD", "Mtry", "min.node.size") 
+
+resultsDf
+```
+
+And we can visualise it also. First some data modifications
+```{r}
+# "Melt" the df so ggplot can use it
+resultsDf <- melt(resultsDf, id.vars = "Features")
+# We only need perfom measure info
+resultsDf <- resultsDf[1:96,]
+# Split SD and values
+# Which rows have SD?
+sdRows <- grep(pattern = "SD", resultsDf[,2])
+# Cbind the split sets
+resultsDf <- cbind(resultsDf[-sdRows,], resultsDf[sdRows, 2:3])
+# Values need to be numeric obviously
+resultsDf[,c(3)] <- as.numeric(resultsDf[,c(3)])
+resultsDf[,c(5)] <- as.numeric(resultsDf[,c(5)])
+# Change names to something sensible
+names(resultsDf) <- c("Features", "Variable", "Value", "SD_Variable", "SD")
+# Also we remove that space that snuck into one feature name
+resultsDf$Features <- gsub("\\s", "", resultsDf$Features)
+```
+
+And plot 
+```{r}
+# Plot
+p1 <- ggplot(resultsDf,
+       aes(
+         x = Features,
+         ymin = Value - SD,
+         ymax = Value + SD,
+         fill = Variable
+       )) +
+  geom_bar(
+    aes(y = Value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(width = .2,
+                colour = "black",
+                position = position_dodge(width = 0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+Now it is hard to compare between features, if we change the grouping around it gets easier to compare between
+features but looks less pretty. 
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+p2 <- ggplot(resultsDf, aes(x = Variable, ymin=Value-SD, ymax=Value+SD, fill = Features)) +   
+  geom_bar(aes(y = Value), colour = "black", position = "dodge", stat="identity", width=0.9) + 
+  scale_y_continuous(name="Value", limits= 0:1) +
+  geom_errorbar(width=.2, colour = "black", position = position_dodge(width=0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+ scale_fill_jco() 
+p2
+```
+
+
+```{r}
+# "summedword2vecFeaturesCombined2GramDim300W25" had the highest MCC, let's see
+# how it performs on a never before seen set of peptides
+# Number 8 in this list is "summedword2vecFeaturesCombined2GramDim300W25"
+train_x <- as.matrix(train_xList[[8]])
+# We also need the test set, x and y
+test_x <- datasetList[[8]][datasetList[[8]][,ncol(datasetList[[8]])-1] %in% trainTest[["test"]],1:(ncol(datasetList[[8]])-2)]
+test_y <- as.numeric(datasetList[[8]][datasetList[[8]][,ncol(datasetList[[8]])-1] %in% trainTest[["test"]],ncol(datasetList[[8]])])
+# Store test sequences
+testSequences <- datasetList[[8]][,ncol(datasetList[[8]])-1][datasetList[[8]][,ncol(datasetList[[8]])-1] %in% trainTest[["test"]]]
+# Train a model on train set
+model <- ranger(x = train_x, y = as.factor(train_y), importance = "impurity", 
+                num.trees = 2000, mtry = 26, min.node.size = 3,
+                case.weights = train_weights)
+# Store this exact model so we can reuse it
+### saveRDS(model, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/rf_models/finalModel/bestRFModelword2vec.rds")
+model <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/rf_models/finalModel/bestRFModelword2vec.rds")
+# Make a prediction with out model on test set
+pred <- predict(model, test_x)
+# List so we can save our performance measures on test set
+testSetPerformance <- list()
+# Use confusion matrix to get all kinds of performance measures on Test set
+testSetPerformance <- caret::confusionMatrix(pred[["predictions"]],
+                           as.factor(test_y),
+                           mode = "everything",
+                           positive = "1")
+testSetPerformance
+# Also get the mcc, which is not inclused in caret::confusionMatrix
+cat("MCC: ")
+testSetPerformance$MCC <- mlr3measures::mcc(as.factor(test_y), pred[["predictions"]], positive = "1")
+testSetPerformance$MCC
+# And we find which sequences were correctly and wrongly predicted
+# Add hemo info and prediction results to test sequences we saved at the start
+testSequences <- data.frame(testSequences, test_y)
+colnames(testSequences) <- c("Sequences", "Hemolytic")
+# Add the predicted class
+testSequences$Prediction <- as.character(pred$predictions)
+# Add if prediction was correct or incorrect
+testSequences$PredictionCorrect <- "Incorrect"
+testSequences[testSequences$Hemolytic == testSequences$Prediction,4] <- "Correct"
+# Store in list
+testSetPerformance$predictionResults <- testSequences
+# Store performance
+saveRDS(testSetPerformance, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/RF_testSetPerformanceWord2vec.rds")
+```
+

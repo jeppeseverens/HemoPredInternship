@@ -1,0 +1,483 @@
+# Dataset creation
+
+Here we will build the dataset of hemolytic and non hemolytic peptides.
+To do so we will use three datasets of hemolytic and non-hemolytic peptides
+that I have found from literature. Let's start
+
+First our libraries
+
+```{r}
+library(stringr)
+library(parallel)
+library(doParallel)
+library(dplyr)
+library(rjson)
+library(pbmcapply)
+library(data.table)
+```
+
+# Loading sequences of hemolytic and non hemolytic peptides
+First I downloaded and stored the fasta files containing sequences of hemolytic 
+and non-hemolytic peptides. For reference: positives refers to hemolytic peptides 
+and negatives to non-hemolytic peptides from here on. 
+
+The datasets were taken from:
+HemoPI: https://webs.iiitd.edu.in/raghava/hemopi/datasets.php 
+- For the positives and negatives, only layer 3 was downloaded, because these 
+are the experimentally confirmed nonhemolytic peps. Both train en valid were downloaded
+
+HLPpred: http://thegleelab.org/HLPpred-Fuse/FuseData.html 
+- For the positives and negatives, only layer 2 was downloaded, because these 
+are the experimentally confirmed nonhemolytic peps. Both train en valid were downloaded
+
+HAPPENN: https://research.timmons.eu/happenn_download
+- Simply the whole dataset was downloaded and I used all peptides
+
+We have a lot of fasta files now, so we need a function to read these fasta files:
+```{r}
+# Function to extract fasta. Inputs are path and pattern
+# path - folder where the fasta files are located 
+# pattern - pattern of the file name(s)
+# Output is peptide sequences as character vector
+extractFASTA <- function(path, pattern) {
+  # Lists the files
+  fastas <-
+    list.files(path = path,
+               pattern = pattern,
+               full.names = TRUE)
+  # Read all lines of all files and puts them in a vector
+  fastas <- unlist(lapply(fastas, readLines))
+  # Remove the names of the sequences, which is always on the first line,
+  # then removes doubles
+  fastas <- unique(fastas[c(FALSE, TRUE)])
+  return(fastas)
+}
+```
+
+Then we read in the sequences
+```{r}
+# HemoPI sequences, split in pos and negs
+posHemopi <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HemoPI/", pattern = ".*3.*pos.*.fa") 
+negHemopi <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HemoPI/", pattern = ".*3.*neg.*.fa")
+
+# HLPpred sequences, split in pos and negs
+posHlppred <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HLPpred", pattern = ".*2.*positive.txt")
+negHlppred <- extractFASTA(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/HLPpred", pattern = ".*2.*negative.txt")
+
+# Happenn fasta needs to be done a bit different since the fasta names contain meta info
+# Read fasta file just by reading lines
+HAPPENN <- readLines("/home/jeppe/Dropbox/internship_TNO/Datasets/HAPPENN/HAPPENN_dataset.fasta") 
+# Make df, set ncol to 2 so first column will contain metadata, second column 
+# peptide sequence. By row for format that I prefer
+HAPPENN <- as.data.frame(matrix(HAPPENN,ncol =2,byrow = T))
+# Set colnames to something sensible
+colnames(HAPPENN) <- c("Hemolytic", "Sequence")
+
+# Meta data contains info on hemo/non-hemo. We don't need anything else for now.
+# So just set to 0 is contain non-hemolytic and 1 if contains hemolytic
+HAPPENN$Hemolytic <- gsub(".*.non-hemolytic", "0", x = HAPPENN$Hemolytic) 
+HAPPENN$Hemolytic <- gsub(".*.hemolytic", "1", x = HAPPENN$Hemolytic) 
+
+# And we store our sequences as seperate vectors
+posHappenn <- as.character(HAPPENN[which(HAPPENN$Hemolytic == 1), 2])
+negHappenn <- as.character(HAPPENN[which(HAPPENN$Hemolytic == 0), 2])
+
+```
+
+The datasets from all authors used the same online sequence sources (Hemolytik and DBAASP) 
+to classify sequences in hemolytic and non-hemolytic, but at different time 
+points and manual. Also HAPPENN used slightly different standards for when a peptide
+is hemolytic/non- compared to the other two. So to make a combined dataset, we 
+combine the positives and negatives, remove the duplicates and remove the sequences 
+that appear in both the pos and neg. There are two reasons that I can think of 
+that sequences can be in pos and neg both. 
+
+1) Annotated differently by the authers of the papers. 
+2) Both hemolytic and non-hemolytic activity registered in DBAASP and/or Hemolytik database.
+
+```{r}
+# Combine HemoPi and HLPpred and HAPPENN and remove duplicates
+# the exp means experimentally comfirmed hemo or non-hemo
+expPos <- unique(c(posHemopi, posHlppred, posHappenn)) 
+expNeg <- unique(c(negHemopi, negHlppred, negHappenn))
+
+# Remove sequences that are in both the pos and neg dataset
+remove1 <- expNeg %in% expPos 
+remove2 <- expPos %in% expNeg
+expNeg <- expNeg[!remove1] 
+expPos <- expPos[!remove2]
+
+cat("Hemolytic sequences length distribution\n")
+summary(str_length(expPos))
+cat("Amount of hemolytic sequences\n")
+length(expPos)
+cat("Non-hemolytic sequences length distribution\n")
+summary(str_length(expNeg))
+cat("Amount of Non-hemolytic sequences\n")
+length(expNeg)
+```
+
+# Re-add intrachain bond and N/C-terminal modification data
+We have now our sequences, but we miss some information that the Hemolytik and 
+DBAASP database do provide. Namely intrachain bond and N/C-terminal modification 
+data but also the information of hemolytic activity in concentration of peptide 
+vs hemolysis of red blood cells. For the Hemolytik database, a html crawler was 
+used in the Chrome browser. This simply turned the online html table in a .csv file. 
+For the DBAASP database I had to use the API to get the database information.
+
+## Accessing the DBAASP db
+First I downloaded the identifiers for monomeric peptides in the DBAASP with 
+length <134, since this is the max length of the sequences in my own database. 
+From here, I downloaded each JSON file for each peptide in the identifier list, 
+checked if it had hemolytic activity information and if so; extraced the peptide
+information that I needed. (bit of a hassle but I guess I can add working with
+APIs to my CV)
+
+```{r} 
+# First download the identifiers for the sequences in DBAASP with <134amino acid length
+# All monomeric peptides from DBAASP, with AA length <134
+DBAASPresults <-
+  fromJSON(file = "https://dbaasp.org/api/v1?query=search&sequence_length%3C=134&format=json")
+# Store the peptide identifiers as a vector
+monomersMaxLength134DBAASP <-
+  DBAASPresults[["result"]] 
+
+# Now the funtion to download the jsons per peptide and extract needed information 
+# out of the json file. The input is peptide number, or in other words the 
+# identification numbers from the vector above.
+# Output is a list with per peptide availble info on hemo activity, c/nterm and
+# intrachain bond
+
+downloadDBAASP <- function(peptide_number) {
+  pep <-
+    fromJSON(
+      file = paste(
+        "https://dbaasp.org/api/v1?query=peptide_card&peptide_id=",
+        peptide_number,
+        "&format=json",
+        sep = ""
+      )
+    ) #Download json file from api link of the peptide we want to assess
+ # If hemolytic information is found, we proceed, without hemo info the peptide
+  # is not in our dataset so we don't need it.
+  if (exists("hemoliticCytotoxicActivities", where = pep[["peptideCard"]]) == TRUE) { 
+    # If peptide has intrachainbond (cyclic), this part will run
+    # store the wanted information in a list
+    if (exists("intrachainBonds", where = pep[["peptideCard"]]) == TRUE) { 
+      data <-
+        c(pep[["peptideCard"]][["seq"]], # Sequence
+          pep[["peptideCard"]][["cTerminus"]], # C-terminus modifictation
+          pep[["peptideCard"]][["nTerminus"]], # N-terminus modifictation
+          pep[["peptideCard"]][["synthesisType"]], # Natural or modified
+          pep[["peptideCard"]][["complexity"]],
+          # Intrachainbonds
+          pep[["peptideCard"]][["intrachainBonds"]][[1]][["intrachainBond"]],  
+          # Intrachainbonds location 1
+          pep[["peptideCard"]][["intrachainBonds"]][[1]][["position1"]], 
+          # Intrachainbonds location 3
+          pep[["peptideCard"]][["intrachainBonds"]][[1]][["position2"]], 
+          # Hemolytic activity information
+          pep[["peptideCard"]][["hemoliticCytotoxicActivities"]]) 
+      # We need collumn names for all the hemolytic activity information
+      names_hemo <-
+        paste0(rep("Hemolytic_activtiy", length(pep[["peptideCard"]][["hemoliticCytotoxicActivities"]])), 1:length(pep[["peptideCard"]][["hemoliticCytotoxicActivities"]])) 
+      names(data) <-
+        c(
+          "Sequence",
+          "C_term_mod",
+          "N_term_mod",
+          "Synthesis",
+          "Complexity",
+          "Intrachainbond",
+          "Intrachainbond_pos1",
+          "Intrachainbond_pos2",
+          names_hemo
+        ) #  Here we name the list dimenstions
+      data <- unlist(data) #  Create vector from list
+      return(data)
+    }
+    else{ #if peptide has NO intrachainbond (cyclic), this part will run. 
+      #  It is the same as above but without the intrachainbond data extraction
+      data <-
+        c(pep[["peptideCard"]][["seq"]], 
+          pep[["peptideCard"]][["cTerminus"]], 
+          pep[["peptideCard"]][["nTerminus"]], 
+          pep[["peptideCard"]][["synthesisType"]], 
+          pep[["peptideCard"]][["complexity"]], 
+          "Linear", # Add linear instead of cyclic as information
+          pep[["peptideCard"]][["hemoliticCytotoxicActivities"]])
+      names_hemo <-
+        paste0(rep("Hemolytic_activtiy", length(pep[["peptideCard"]][["hemoliticCytotoxicActivities"]])), 1:length(pep[["peptideCard"]][["hemoliticCytotoxicActivities"]]))
+      names(data) <-
+        c(
+          "Sequence",
+          "C_term_mod",
+          "N_term_mod",
+          "Synthesis",
+          "Complexity",
+          "Intrachainbond",
+          names_hemo
+        )
+      data <- unlist(data)
+      return(data)
+    }
+  }
+}
+
+# Now for each identifier we have to download the "peptide card" and extract info. 
+# We use mclappy to speed it up.
+# 20 minutes on my laptop and home wifi, pbmclappy for progress bar
+# I think this is mostly limited by the download speed of DBAASP (which is slow)
+DBAASP_db <-
+  pbmcmapply(
+    downloadDBAASP,
+    monomersMaxLength134DBAASP,
+    mc.cores = 8,
+    SIMPLIFY = TRUE,
+    USE.NAMES = FALSE
+  ) 
+
+DBAASP_db[sapply(DBAASP_db, is.null)] <- NULL #  delete all empty vectors
+
+# Save
+saveRDS(DBAASP_db, file = "/home/jeppe/Dropbox/internship_TNO/Datasets/DBAASP/DBAASP_raw.rds")
+# Load
+DBAASP_db <-
+  readRDS(file = "/home/jeppe/Dropbox/internship_TNO/Datasets/DBAASP/DBAASP_raw.rds")
+# Creates list of lists for rbindlist to work. I used rbindlist because it 
+# easily handles vectors of different lengths when creating a dataframe
+DBAASP_db <- lapply(DBAASP_db, as.list) 
+# Turn our list into a dataframe
+df <- rbindlist(DBAASP_db, fill = TRUE) 
+
+# I asked for length <134 where does this 190 come from, but does not really matter
+summary(str_length(df$Sequence)) 
+table(str_length(df$Sequence))
+
+# Remove all unnatural AA
+# Remove seq's with unnatural AA
+DBAASP_db_natural <-
+  df[!grep(pattern = "[BJOUXZ]+", x = df$Sequence), ]
+# Remove seqs with unnatural AA
+DBAASP_db_natural <-
+  DBAASP_db_natural[!grep(pattern = "[[:lower:]]", x = DBAASP_db_natural$Sequence), ] 
+# Remove all seqs with weird stuff
+DBAASP_db_natural <-
+  DBAASP_db_natural[!grep(pattern = ".*[-\\.\\_].*", x = DBAASP_db_natural$Sequence), ] 
+
+# emove sequences with only non hemolytic info
+# Not all hemo info is hemo info, some of it is on kidney cell toxicity etc., 
+# could be interesting but I remove it for now.
+
+# First collect all column names with information on interaction with cells
+columns <-
+  grep(pattern = ".+.targetCell",
+       x = colnames(DBAASP_db_natural),
+       value = TRUE) 
+store <- c()
+# If our sequence contains information on interaction with red blood cells 
+# we select to keep the sequence
+for (column in columns) {
+  to_keep <-
+    grep(pattern = ".+erythrocytes", x = DBAASP_db_natural[[column]])
+  if (length(to_keep) > 1)
+    store <- append(store, to_keep)
+}
+# We keep these
+to_keep <- unique(store)
+DBAASP_db_natural_hemo <- DBAASP_db_natural[to_keep, ]
+
+# Store so you dont need to do this again
+write.csv(DBAASP_db_natural_hemo, 
+          file = "/home/jeppe/Dropbox/internship_TNO/Datasets/DBAASP/DBAASP.csv", 
+          sep = ",")
+
+summary(str_length(DBAASP_db_natural_hemo$Sequence))
+```
+
+
+## Re-add the meta information to our sequences
+Here we are going to crossref our database of hemolytic and non-hemolytic 
+peptides so we can have the N/C term mods and the intrachain bond info combined
+with the sequence and hemolytic activity.
+
+First load both the DBSAAP and Hemolytik db. Then we make sure column names are 
+the same and we rowbind the two databases to combine them
+
+```{r}
+# Read in the df we created above
+DBAASP <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/DBAASP/DBAASP.csv") 
+summary(str_length(DBAASP$Sequence))
+
+# Read in the hemolytik df I extracted with html scraper
+Hemolytik <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/Hemolytik/hemolytikAll16april.csv") 
+summary(str_length(Hemolytik$Sequence))
+
+# Make colnames the same
+names(Hemolytik)[names(Hemolytik) == 'N_ter_MOD'] <- 'N_term_mod'
+names(Hemolytik)[names(Hemolytik) == 'C_ter_mod'] <- 'C_term_mod'
+names(Hemolytik)[names(Hemolytik) == 'Form'] <- 'Intrachainbond'
+
+# This is the info we need for now
+columns_to_keep <- c("Sequence", "C_term_mod", "N_term_mod", "Intrachainbond")
+# Combine dfs with only interesting columns
+df_sources <- rbind(DBAASP[columns_to_keep], Hemolytik[columns_to_keep])
+```
+
+Cross ref with HemoPI and HLPpred databases to add hemolytic and non-hemolytic info
+```{r}
+# Split in hemolytic non-hemolytic
+df_sources_pos <- df_sources[df_sources$Sequence %in% expPos,] 
+df_sources_neg <- df_sources[df_sources$Sequence %in% expNeg,]
+# Add hemolytic/nonhemolytic info
+df_sources_pos$Hemolytic <- 1 
+df_sources_neg$Hemolytic <- 0
+# Combine again
+df_sources <- rbind(df_sources_pos, df_sources_neg) 
+```
+
+Change some names of the data so it is better readable
+```{r}
+df_sources$C_term_mod <- gsub(pattern = "AMD", replacement = "Amidation", x = df_sources$C_term_mod)
+df_sources$C_term_mod <- gsub(pattern = "#", replacement = "Free", x = df_sources$C_term_mod)
+df_sources$C_term_mod <- gsub(pattern = "Ome", replacement = "Methylester", x = df_sources$C_term_mod)
+
+df_sources$N_term_mod <- gsub(pattern = "ACT", replacement = "Acetylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "BZO", replacement = "Benzoylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "BZY", replacement = "Benzoylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "TOS", replacement = "Tosylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "FOR", replacement = "Formylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "FMOC", replacement = "Fmoc", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "DNS", replacement = "Dansylation", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "#", replacement = "Free", x = df_sources$N_term_mod)
+
+df_sources$N_term_mod <- gsub(pattern = "Conjugated with lauric acid", replacement = "C12", x = df_sources$N_term_mod)
+df_sources$N_term_mod <- gsub(pattern = "pHCA= Hydroxy cinnamic acid", replacement = "pHCA", x = df_sources$N_term_mod)
+
+# We have all these n/c terminal mods:
+summary(rbind(as.matrix(df_sources$N_term_mod), as.matrix(df_sources$C_term_mod)), maxsum = 3000)
+length(summary(rbind(as.matrix(df_sources$N_term_mod), as.matrix(df_sources$C_term_mod)), maxsum = 3000)
+)
+```
+
+A lot of weird and unnatural modifications. For now I choose to keep only natural mods
+```{r}
+# Modifications to keep
+mods_to_keep <- c("Free", "Amidation", "Acetylation", "Formylation")
+# Only keep these mods
+df_sources <- df_sources[df_sources$C_term_mod %in% mods_to_keep,] 
+df_sources <- df_sources[df_sources$N_term_mod %in% mods_to_keep,]
+```
+
+I have no way to easy trace what cyclic form the peptides from the hemolytik db have. 
+for now I will just annotate all cyclic mods in DBAASP as cyclic.
+```{r}
+#Change the different intrachain bonds to the simpler annotation "cyclic"
+df_sources$Intrachainbond <- gsub(pattern = "DCB", replacement = "Cyclic", x = df_sources$Intrachainbond)
+df_sources$Intrachainbond <- gsub(pattern = "DSB", replacement = "Cyclic", x = df_sources$Intrachainbond)
+df_sources$Intrachainbond <- gsub(pattern = "NCB", replacement = "Cyclic", x = df_sources$Intrachainbond)
+df_sources$Intrachainbond <- gsub(pattern = "Para-XylB", replacement = "Cyclic", x = df_sources$Intrachainbond)
+```
+
+Now we only keep distinct rows to remove doubles and we have our almost finished 
+database of hemolytic and non-hemolytic peptides. 
+With information on N/C-terminus mods and intrachainbonds 
+```{r}
+# Remove rows that are not distinct and we have our almost final db
+df_exp <- df_sources %>% distinct(.keep_all = TRUE) 
+cat("Sequence length (first and third row) and the amount of sequences of this length (second and fourth row)\n")
+table(str_length(df_exp$Sequence))
+cat("\nSumary table of sequence lengths\n")
+summary(str_length(df_exp$Sequence))
+cat("\nAmount of hemolytic peptides\n")
+length(which(df_exp$Hemolytic == 1))
+cat("\nAmount of non-hemolytic peptides\n")
+length(which(df_exp$Hemolytic == 0))
+```
+
+Sanity check to show there are now sequences with different mods and bonds but same sequence
+```{r}
+df_exp %>% group_by(Sequence) %>% filter(n()>1) %>% arrange(Sequence, desc(Intrachainbond == 'Linear'))
+```
+
+But there are no entries with the same sequence, different mods and then 
+differen hemolytic class, so I will just remove the duplicates with a preference 
+for the linear peps.
+```{r}
+# Sort by intrachain bond with a preference for linear on top, keep distinct rows.
+# distinct() keeps first row so since linear is at the top it will keep that row
+df_exp <- df_sources %>% arrange(Sequence, desc(Intrachainbond == 'Linear')) %>% distinct(Sequence, .keep_all = TRUE)
+
+cat("\nAmount of hemolytic peptides\n")
+length(which(df_exp$Hemolytic == 1))
+cat("\nAmount of non-hemolytic peptides\n")
+length(which(df_exp$Hemolytic == 0))
+
+# And store
+write.csv(df_exp, file = "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/expHemoNonhemoPeps.csv")
+```
+
+As you can see we have an unbalance between the amount of hemolytic and non-hemolytic peptides. 
+We can fix this later in the ML methods by adding class weigths.
+
+Create holdout set and traiing set. The training set will be used for n-fold 
+cross validation of models and to optimize hyperparameters
+
+```{r}
+# Set seed so it is reproducable
+set.seed(2)
+# Store sequences
+sequences <- as.vector(df_exp$Sequence)
+# Sample 80% for training
+trainingSequences <- sample(sequences, size = 0.8*length(sequences))
+# Rest (20%) for testing
+testSequences <- sequences[!(sequences %in% trainingSequences)]
+
+# Store in a nice list
+trainTest <- list()
+trainTest$train <- trainingSequences
+trainTest$test <- testSequences
+
+cat("Sequence length distribution training sequences\n")
+summary(str_length(trainingSequences))
+cat("\nSequence length distribution test sequences\n")
+summary(str_length(testSequences))
+cat("\nPercentage of non-hemo and hemo in train set\n")
+table(df_exp[df_exp$Sequence %in% trainTest$train, "Hemolytic"])/length(df_exp[df_exp$Sequence %in% trainTest$train, "Hemolytic"]) * 100
+cat("\nPercentage of non-hemo and hemo in test set\n")
+table(df_exp[df_exp$Sequence %in% trainTest$test, "Hemolytic"])/length(df_exp[df_exp$Sequence %in% trainTest$test, "Hemolytic"]) * 100
+
+
+# And save
+saveRDS(trainTest, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+```
+
+And we need the fastas for SS3 prediction and maybe some other stuff
+```{r}
+# Store sequences
+sequences <- as.vector(df_exp$Sequence)
+trainSequences <- sequences[sequences %in% trainTest[["train"]]]
+testSequences <- sequences[sequences %in% trainTest[["test"]]]
+
+# Create names, just peptide + 1 till length of df
+fastaNames <- paste(">peptide", seq(1, length(sequences)), sep ="_") 
+# Create vector to print as lines to get fasta format
+fasta <- c(rbind(fastaNames, sequences)) 
+# Write lines
+writeLines(fasta, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/sequences.fasta")
+
+# Create names, just peptide + 1 till length of df
+fastaNames <- paste(">peptide", seq(1, length(trainSequences)), sep ="_") 
+# Create vector to print as lines to get fasta format
+fasta <- c(rbind(fastaNames, trainSequences)) 
+# Write lines
+writeLines(fasta, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/trainSequences.fasta")
+
+# Create names, just peptide + 1 till length of df
+fastaNames <- paste(">peptide", seq(1, length(testSequences)), sep ="_") 
+# Create vector to print as lines to get fasta format
+fasta <- c(rbind(fastaNames, testSequences)) 
+# Write lines
+writeLines(fasta, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/testSequences.fasta")
+```
+

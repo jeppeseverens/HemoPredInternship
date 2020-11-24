@@ -1,0 +1,794 @@
+# CNN on one hot encodes sequence and secondary structure
+
+Here we are going to run four CNN models on one hot encoded sequence and secondary 
+structure and as a comparison also on one hot encoded sequence alone
+
+# Libraries
+```{r}
+library(stringr)
+library(keras)
+library(tfruns)
+library(tensorflow)
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+requireNamespace("mlr3measures")
+library(reshape2)
+library(ggsci)
+```
+
+# Load input data and reformat
+Let's load our one hot encoded sequences first and then we need to change the 
+format so that Keras/Tensorflow can use it.
+Data needs to be inputted as an array for a CNN
+
+First out input data
+```{r}
+# Load dataset
+dataset <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/onehotSequenceandSS.rds")
+
+# Train and test split
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+
+# Get our sequences seperately so we can split train and test
+sequences <- unlist(lapply(dataset, `[`, c('Sequence')))
+
+Train <- dataset[sequences %in% trainTest[["train"]]]
+Test <- dataset[sequences %in% trainTest[["test"]]]
+
+# Dimensions of the array
+# Height is going to be our max length of our sequences
+# and length is the ammount of amino acids + secondary structures (20 + 3)
+#
+#    AA (20)  SS(3)
+#   1 ___________ 23
+#    |___________|
+#    |___________|
+#    |___________|
+#    |___________|
+#    |___________|
+#    |___________|
+#   133
+# 
+# Set dimensions
+height <- max(str_length(sequences))
+length <- 23
+
+
+# First get our y (hemolytic/non-hemolytic)
+Train_y <-  as.integer(unlist(lapply(Train, `[`, c('Hemolytic'))))
+Test_y <-  as.integer(unlist(lapply(Test, `[`, c('Hemolytic'))))
+
+# And our X arrays, collumbind with t() to get sequence and secondary structure
+# combined in correct format, rbind everything to get a huge matrix of all
+# the 1 hot encoded data
+Train_x <- do.call(rbind, lapply(1:length(Train), function(x) rbind(cbind(t(Train[[x]][["Sequence_1H"]]), t(Train[[x]][["SS3_sequence_1H"]])))))
+
+# Reshape to array, use array_reshape because it works row-major style,
+# this splits our matrix in arrays of smaller matrices
+Train_x <- array_reshape(Train_x, dim = c(length(Train), height, length))
+
+# Same for test set 
+Test_x <- do.call(rbind, lapply(1:length(Test), function(x) rbind(cbind(t(Test[[x]][["Sequence_1H"]]), t(Test[[x]][["SS3_sequence_1H"]])))))
+Test_x <- array_reshape(Test_x, dim = c(length(Test), height, length))
+
+# And store test sequences for later
+testSequences <- sequences[sequences %in% trainTest[["test"]]]
+
+# Set the input shape for Keras
+input_shape <- c(height, length)
+
+# Weights to overcome class imbalances for Keras
+# For each hemolytic peptide there is ~1.3 non-hemolytic peptide
+# So class weights are set to 0 = 1 and 1 = 1.3 to balance it out
+weight_1 <- as.numeric(table(Train_y)[1]/table(Train_y)[2])
+class_weight <- list("0" = 1, "1" = weight_1)
+
+cat("Sequence\n")
+sequences[1]
+cat("\n1 hot encoded Sequence (+secondary structure) \n")
+Test_x[1,,]
+```
+
+Let's train a model
+
+```{r}
+# Set mode to sequential, this is a mode to build Keras models with %>% calls
+# Keras/TF does not need to store your model with <-, confusing but it is what
+# it is.
+model <- keras_model_sequential()
+
+# Here we set up how our model will work, 2 Conv. layers, 1 dense layer and
+# 1 decision layer. With ReLu activation layers and Sigmoid for the decision
+# layer
+model %>%
+  # Convolution part
+  layer_conv_1d(
+    filters = 64,  #  Number of filters of the conv. layer
+    kernel_size = c(10),  # Window size
+    strides = 1,  # Step size
+    input_shape = input_shape,  # Input shape
+    padding = "same"  # Padding so our array length keeps at 133
+  )  %>%
+  layer_activation_relu() %>%  # Activation layer
+  layer_dropout(rate = 0.6) %>%  # Dropout layer
+  
+  layer_conv_1d( 
+    filters = 64,
+    kernel_size = c(12),
+    strides = 1,
+    padding = "same"
+  )  %>%
+  layer_activation_relu() %>%
+  layer_dropout(rate = 0.6) %>%
+  
+  layer_flatten() %>%  # Flatten the output so a dense layer can handle it
+  
+  # Dense layer part (fully connected layer is also a term that is used)
+  layer_dense(units = 16) %>%  # Number of nodes in the dense layer
+  layer_activation_relu() %>%
+  layer_dropout(rate = 0.6) %>%
+  
+  # Activation layer
+  layer_dense(units = 1, activation = 'sigmoid')  # Activation layer
+
+# Here we set up how the model should be optimized, we will use the
+# Adam optimizer which works well for binary data, and the binary_crossentropy
+# loss function because we are working with binary classification
+# We set the evaluation metric to accuracy, but we won't really use it
+model %>% compile(optimizer = 'adam',
+                        loss = 'binary_crossentropy',
+                        metrics = list('accuracy'))
+
+# And we train the model, batch size 32 because that is standard number and we
+# use 25 epochs (or number of times) to run over our training data
+# We let keras take a part of the training data as validation split
+# and we set out class weights here
+# Callback_early_stopping will monitor the loss of the validation_set and stop
+# if it does not lower for 5 steps
+model %>% fit(
+  Train_x,
+  Train_y,
+  verbose = 1,
+  epochs = 25,
+  batch_size = 32,
+  validation_split = 0.2,
+  class_weight = class_weight,
+  callbacks = list(callback_early_stopping(monitor = "val_loss", min_delta = 1e-04, patience = 5))
+)
+```
+
+Seems to work avarage, so we can optimize it with a build in function from Keras/TF.
+First we need to setup a train R file, which keras will run through. The flags are the
+possible options for each hyperparameter.
+
+I have saved the script below in nn1HotTrain2CNN1Dense.R. It runs through a combination of
+hyperparameters 5 times with 5 different splits of train/valid (75/25). We do this 
+by calling sample 5 times in a loop but we vary the set.seed value each time:
+thus we get a different split. The trained model is then used to predict the valid
+set and the results are stored so we can take the mean and sd later and see which 
+combination worked best. I have also created scripts nn1HotTrain2CNN2Dense.R and
+nn1HotTrain1CNN1Dense.R and nn1HotTrain1CNN2Dense.R
+
+nn1HotTrain1CNN1Dense.R - 1 conv layer - 1 dense layer
+nn1HotTrain1CNN2Dense.R - 1 conv layer - 2 dense layers
+nn1HotTrain2CNN1Dense.R - 2 conv layers - 1 dense layer
+nn1HotTrain2CNN2Dense.R - 2 conv layer - 2 dense layers
+
+```{r}
+### 2 conv layers - 1 dense layer example: ###
+#Set up correct map structure to use 
+features <- "1hSequenceStructure"
+# Set the flags, or the hyperparameters we will vary, with default values.
+FLAGS = flags( 
+  flag_numeric("dropout", 0.6), 
+  flag_numeric("layer1_filters", 64),
+  flag_numeric("layer2_filters", 64),
+  flag_numeric("layer3_units", 16),
+  flag_numeric("kernel_size1", 5),
+  flag_numeric("kernel_size2", 5),
+  flag_numeric("batch_size", 32)
+  )
+
+# We need a temporary list to store our results 
+temp <- list()
+
+# We store our Flags in this list so we know what hyperparameters were used in the
+# run
+flags <- c(0.6, FLAGS$layer1_filters, FLAGS$layer2_filters, FLAGS$layer3_units, FLAGS$kernel_size1, FLAGS$kernel_size2, FLAGS$batch_size)
+temp$flags <- flags
+
+# We also collapse the flags so we can use it as a name for the stored .rds of the run
+name <- paste(as.character(flags), collapse = "_")
+
+# Set n = 1 for the runs so for each of the 5 runs we can store valid parameters
+n = 1
+
+# List to store the results of the predictions of the validation set
+valid = list()
+
+# Start with our loop, sample 5 times a random number to use in set.seed
+for (i in sample(100000000, 5)) {
+  set.seed(i) #  Set out seed
+  
+  # This is all the same as above, but now we have our flags for hyperparameters
+  model <- keras_model_sequential()
+  model %>%
+    layer_conv_1d(
+      filters = FLAGS$layer1_filters,
+      kernel_size = c(FLAGS$kernel_size1),
+      strides = 1,
+      input_shape = input_shape,
+      padding = "same"
+    )  %>%
+    layer_activation_relu() %>%
+    layer_dropout(rate = FLAGS$dropout) %>%
+    layer_conv_1d(
+      filters = FLAGS$layer2_filters,
+      kernel_size = c(FLAGS$kernel_size2),
+      strides = 1,
+      padding = "same"
+    )  %>%
+    layer_activation_relu() %>%
+    layer_dropout(rate = FLAGS$dropout) %>%
+    layer_flatten() %>%
+    
+    layer_dense(units = FLAGS$layer3_units) %>%
+    layer_activation_relu() %>%
+    layer_dropout(rate = FLAGS$dropout) %>%
+    
+    layer_dense(units = 1, activation = 'sigmoid')
+  
+  model %>% compile(
+    optimizer = 'adam',
+    loss = 'binary_crossentropy',
+    metrics = list('accuracy')
+  )
+  
+  # We sample 75$ from our train set to use for train and the rest we use for valid
+  sample <-
+    sample(1:length(Train_y), 0.75 * length(Train_y), replace = FALSE)
+  # Train model
+  model %>% fit(
+    Train_x[sample, , , drop = FALSE],  # 75% of train_x
+    Train_y[sample],  # 75% of train_y
+    verbose = 0, # don't need output this time
+    validation_data =  list(Train_x[-sample, , , drop = FALSE], Train_y[-sample]),  # here we set out validation data
+    epochs = 200,  # just a high number, callback will stop it early
+    class_weight = class_weight,
+    batch_size = FLAGS$batch_size,
+    callbacks = list(
+      callback_early_stopping(
+        monitor = "val_loss",
+        min_delta = 1e-04,
+        patience = 5
+      )
+    )
+  )
+  
+  # Make a prediction with out model on validation set
+  pred <- predict_classes(model, Train_x[-sample, , , drop = FALSE])
+  
+  # Use confusion matrix to get all kinds of performance measures on valid set
+  valid[[n]] <-
+    caret::confusionMatrix(as.factor(pred),
+                           as.factor(Train_y[-sample]),
+                           mode = "everything",
+                           positive = "1")
+  # Also get the mcc, which is not inclused in caret::confusionMatrix
+  valid[[n]][["mcc"]] <-
+    mlr3measures::mcc(as.factor(Train_y[-sample]), as.factor(pred), positive = "1")
+  
+  # Increase n for the next run
+  n = n + 1
+}
+
+# Store our performance measures on validation data for all 5 runs
+temp$valid_parameters <- valid
+
+# Save it as rds with flags as name so we can later analyse which model worked best
+saveRDS(temp, paste0("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/", features, "/2c1d/cnn_2c1d_", features, name, ".rds"))
+```
+
+nn1HotTrain1CNN1Dense.R - 1 conv layer - 1 dense layer.
+Dont forget to answer Y in the terminal to start the runs
+
+```{r}
+# This runs several runs with combinations of the below supplied possible
+# hyperparameters. We can (try to) find the best performing combination this way
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain1CNN1Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      kernel_size1 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.5, #  This is computatinally very expensive so we sample from our grid
+    echo = FALSE
+  )
+```
+
+nn1HotTrain1CNN2Dense.R - 1 conv layer - 2 dense layers
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain1CNN2Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      layer4_units = c(8, 16, 32),
+      kernel_size1 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.3,
+    echo = FALSE
+  )
+```
+
+nn1HotTrain2CNN1Dense.R - 2 conv layers - 1 dense layer
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain2CNN1Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer2_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      kernel_size1 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      kernel_size2 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.2,
+    echo = FALSE
+  )
+```
+
+nn1HotTrain2CNN2Dense.R - 2 conv layer - 2 dense layers
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain2CNN2Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer2_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      layer4_units = c(8, 16, 32),
+      kernel_size1 = c(7, 8, 9, 10, 11, 12),
+      kernel_size2 = c(7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.2,
+    echo = FALSE
+  )
+```
+
+Now we need to extract the results and find the best model
+First we need a function to extract our results on the validation data
+
+```{r}
+# Input:
+# result is an list of results we get from our nn?HotTrain?CNN2Dense.R scripts
+# kfolds is the number of k fold cross validarion we used, in our case always 5
+# Output is a dataframe with performance measures and the hyperparameters used
+
+getCnnCvResults <- function(result, kfolds){
+  kfolds <- 1:kfolds  # number of folds
+  flags <- result[["flags"]] # store flags so we know what hyperparameters we used
+  performanceDf <- as.data.frame(t(data.frame(flags))) #df to bind information to
+  rownames(performanceDf) <- NULL
+  
+  # All kinds of performance measures
+  # We take the mean and the standard deviation (sd)
+  performanceDf$mcc <- mean(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["mcc"]])))
+  performanceDf$mccSD <- sd(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["mcc"]])))
+  performanceDf$sens <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Sensitivity"]])))
+  performanceDf$sensSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Sensitivity"]])))
+  performanceDf$spec <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Specificity"]])))
+  performanceDf$specSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Specificity"]])))
+  performanceDf$acc <- mean(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["overall"]][["Accuracy"]])))
+  performanceDf$accSD <- sd(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["overall"]][["Accuracy"]])))
+  performanceDf$prec <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Precision"]])))  
+  performanceDf$precSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Precision"]])))
+  performanceDf$recall <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Recall"]])))
+  performanceDf$recallSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Recall"]])))
+  
+  # Return our df
+  return(performanceDf)
+}
+```
+
+And now for our 1CNN1Dense, 1CNN2Dense, 2CNN1Dense and 2CNN2Dense we extract 
+the performance measures for each possible model and the hyperparameters
+
+```{r}
+# For each model extract all results
+results1CNNC1Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequenceStructure/1c1d/", ".rds", full.names = TRUE)
+results1CNNC1Dense <- lapply(results1CNNC1Dense, function(x) readRDS(x))
+
+results1CNNC2Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequenceStructure/1c2d/", ".rds", full.names = TRUE)
+results1CNNC2Dense <- lapply(results1CNNC2Dense, function(x) readRDS(x))
+
+results2CNNC1Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequenceStructure/2c1d/", ".rds", full.names = TRUE)
+results2CNNC1Dense <- lapply(results2CNNC1Dense, function(x) readRDS(x))
+
+results2CNNC2Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequenceStructure/2c2d/", ".rds", full.names = TRUE)
+results2CNNC2Dense <- lapply(results2CNNC2Dense, function(x) readRDS(x))
+
+# For each model we then read out the mean and SD of several performance measures
+# with our above determined function and bind it in a list
+resultsList1hSequenceStructure <-
+  lapply(list( # lapply to these lists from above
+    results1CNNC1Dense,
+    results1CNNC2Dense,
+    results2CNNC1Dense,
+    results2CNNC2Dense
+  ), function(x) {
+    resultsTemp <-
+      mclapply(x, getCnnCvResults, kfolds = 5, mc.cores = 6)
+    collumNames <- colnames(resultsTemp[[1]]) #  Set colnames to something sensible
+    resultsTemp <-
+      data.frame(matrix(
+        unlist(resultsTemp),
+        nrow = length(resultsTemp),
+        byrow = T
+      ), stringsAsFactors = FALSE) # Create from the outputted list a df
+    colnames(resultsTemp) <- collumNames #  Set colnames
+    return(resultsTemp)
+  })
+```
+
+And the results for the different CNN models, with sequence and structure in 
+1h encoded format
+
+```{r}
+# Find which hyperparameter combination has the best performance as per the MCC
+# show that row and thus all performance measures for that model
+lapply(list(1,2,3,4), function(i) resultsList1hSequenceStructure[[i]][which(resultsList1hSequenceStructure[[i]][["mcc"]] == max(resultsList1hSequenceStructure[[i]][["mcc"]])),])
+```
+
+# Now for the sequence info only
+As a comparison, to see if secondary structure helped with classification, we 
+will run the four models also on sequence 1 hot info only.
+
+nn1HotTrain1CNN1Dense.R - 1 conv layer - 1 dense layer.
+Dont forget to answer Y in the terminal to start the runs
+
+First lets edit our Train_x set
+
+```{r}
+# Just remove all last 3 columns to get our one hot info of sequence only
+Train_x_sequence <- Train_x[,, 1:20]
+
+# Backup one hot encoded sequence and structure train set
+Train_x_sequence_secondarystruc <- Train_x
+
+# For our scripts we set train_x to Train_x_sequence, saves rewriting
+Train_x <- Train_x_sequence
+
+# And set the correct folder for our runs
+features <- "1hSequence"
+
+# And set our dimensions for input
+input_shape <- c(133,20)
+```
+
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain1CNN1Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      kernel_size1 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.5,
+    echo = FALSE
+  )
+```
+
+nn1HotTrain1CNN2Dense.R - 1 conv layer - 2 dense layers
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain1CNN2Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      layer4_units = c(8, 16, 32),
+      kernel_size1 = c(5, 6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.3,
+    echo = FALSE
+  )
+```
+
+nn1HotTrain2CNN1Dense.R - 2 conv layers - 1 dense layer
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain2CNN1Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer2_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      kernel_size1 = c(6, 7, 8, 9, 10, 11, 12),
+      kernel_size2 = c(6, 7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.2,
+    echo = FALSE
+  )
+```
+
+nn1HotTrain2CNN2Dense.R - 2 conv layer - 2 dense layers
+
+```{r}
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/NN1hTrainScripts/nn1HotTrain2CNN2Dense.R",
+    flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(16, 32, 64),
+      layer2_filters = c(16, 32, 64),
+      layer3_units = c(8, 16, 32),
+      layer4_units = c(8, 16, 32),
+      kernel_size1 = c(7, 8, 9, 10, 11, 12),
+      kernel_size2 = c(7, 8, 9, 10, 11, 12),
+      batch_size = c(32)
+    ),
+    sample = 0.2,
+    echo = FALSE
+  )
+```
+
+Again we need to check the results, we just reuse code from above for 
+sequence + stucture as one hot.
+
+```{r}
+# For each model extract all results
+results1CNNC1Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequence/1c1d/", ".rds", full.names = TRUE)
+results1CNNC1Dense <- lapply(results1CNNC1Dense, function(x) readRDS(x))
+
+results1CNNC2Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequence/1c2d/", ".rds", full.names = TRUE)
+results1CNNC2Dense <- lapply(results1CNNC2Dense, function(x) readRDS(x))
+
+results2CNNC1Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequence/2c1d/", ".rds", full.names = TRUE)
+results2CNNC1Dense <- lapply(results2CNNC1Dense, function(x) readRDS(x))
+
+results2CNNC2Dense <- list.files("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/cnn_models/1hSequence/2c2d/", ".rds", full.names = TRUE)
+results2CNNC2Dense <- lapply(results2CNNC2Dense, function(x) readRDS(x))
+
+# For each model we then read out the mean and SD of several performance measures
+# with our above determined function and bind it in a list
+resultsList1hSequence <-
+  lapply(list( # lapply to these lists from above
+    results1CNNC1Dense,
+    results1CNNC2Dense,
+    results2CNNC1Dense,
+    results2CNNC2Dense
+  ), function(x) {
+    resultsTemp <-
+      mclapply(x, getCnnCvResults, kfolds = 5, mc.cores = 6)
+    collumNames <- colnames(resultsTemp[[1]]) #  Set colnames to something sensible
+    resultsTemp <-
+      data.frame(matrix(
+        unlist(resultsTemp),
+        nrow = length(resultsTemp),
+        byrow = T
+      ), stringsAsFactors = FALSE) # Create from the outputted list a df
+    colnames(resultsTemp) <- collumNames #  Set colnames
+    return(resultsTemp)
+  })
+```
+
+```{r}
+# Find which hyperparameter combination has the best performance as per the MCC
+# show that row and thus all performance measures
+lapply(list(1,2,3,4), function(i) resultsList1hSequence[[i]][which(resultsList1hSequence[[i]][["mcc"]] == max(resultsList1hSequence[[i]][["mcc"]])),])
+```
+
+Lets visualise our results and combine them in a nice df so we can compare out 4 models, with 
+2 different features as input.
+
+```{r}
+# Get from the result list, for each of the 4 models used, the MCC, Sens, Spec 
+# and Acc for the best performing combination of hyperparameters as per the MCC.
+# And of course the SD for each performance measure
+resultsSequenceMatrix <- data.frame(matrix(unlist(lapply(list(1,2,3,4), function(i) {
+  # Columns to keep, corresponds to the perf. measures to keep
+  keep <- (length(resultsList1hSequence[[i]])-11):(length(resultsList1hSequence[[i]])-4)
+  # Which row contains the highest MCC, we keep that one
+  df <- resultsList1hSequence[[i]][which(resultsList1hSequence[[i]][["mcc"]] == max(resultsList1hSequence[[i]][["mcc"]])),]
+  # Only keep columns we want
+  df <- df[,keep]
+  return(df)
+  })),
+  # Unlist and to matrix of 4 rows (4 models), and then to df
+  byrow = T, nrow = 4), stringsAsFactors = F)
+# Same for 1h encoded sequence + structure as feature
+resultsSequenceStructureMatrix <- data.frame(matrix(unlist(lapply(list(1,2,3,4), function(i) {
+  # Columns to keep, corresponds to the perf. measures to keep
+  keep <- (length(resultsList1hSequenceStructure[[i]])-11):(length(resultsList1hSequenceStructure[[i]])-4)
+  # Which row contains the highest MCC, we keep that one
+  df <- resultsList1hSequenceStructure[[i]][which(resultsList1hSequenceStructure[[i]][["mcc"]] == max(resultsList1hSequenceStructure[[i]][["mcc"]])),]
+  # Only keep columns we want
+  df <- df[,keep]
+  return(df)
+  })), 
+  # Unlist and to matrix of 4 rows (4 models), and then to df
+  byrow = T, nrow = 4), stringsAsFactors = F)
+
+# Bind the df's
+resultsDf <- rbind(resultsSequenceMatrix, resultsSequenceStructureMatrix)
+# Add colnames that make sense
+keep <- (length(resultsList1hSequence[[1]])-11):(length(resultsList1hSequence[[1]])-4)
+colnames(resultsDf) <- colnames(resultsList1hSequence[[1]][,keep])
+# Add collumns which what features were used and as input to what model
+resultsDf$Features <- c(rep("1hSequence", 4), rep("1hSequenceStructure", 4))
+resultsDf$Model <- c(rep(
+    c("1 Conv 1 Dense", "1 Conv 2 Dense", "2 Conv 1 Dense", "2 Conv 2 Dense"), 2
+  ))
+resultsDf$Variable <- paste("Feature:", resultsDf$Features, "-", "Model:", resultsDf$Model)
+resultsDf <- melt(resultsDf, id.vars = "Variable")
+resultsDf <- resultsDf[1:64,]
+# Which rows have SD?
+sdRows <- grep(pattern = "SD", resultsDf[,2])
+# Cbind the split sets
+resultsDf <- cbind(resultsDf[-sdRows,], resultsDf[sdRows, 2:3])
+# Values need to be numeric obviously
+resultsDf[,c(3)] <- as.numeric(resultsDf[,c(3)])
+resultsDf[,c(5)] <- as.numeric(resultsDf[,c(5)])
+# Change names to something sensible
+names(resultsDf) <- c("Features", "Variable", "Value", "SD_Variable", "SD")
+```
+
+And plot 
+
+```{r}
+# Plot
+p1 <- ggplot(resultsDf,
+       aes(
+         x = Features,
+         ymin = Value - SD,
+         ymax = Value + SD,
+         fill = Variable
+       )) +
+  geom_bar(
+    aes(y = Value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(width = .2,
+                colour = "black",
+                position = position_dodge(width = 0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+Now it is hard to compare between features, if we change the grouping around it gets easier to compare between
+features but looks less pretty. 
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+p2 <- ggplot(resultsDf, aes(x = Variable, fill = Features)) +
+  geom_bar(aes(y = Value),
+           colour = "black",
+           position = "dodge",
+           stat = "identity",
+           width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(
+    aes(ymin = Value - SD, ymax = Value + SD),
+    width = .2,
+    colour = "black",
+    position = position_dodge(0.9)
+  ) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco() 
+p2
+```
+
+So the 1 hot encoded sequence and structure combined with a model with two 
+convolution layers and 1 dense layer gave the highest MCC. So let's train a model
+with the whole training set, with the best features, model and hyperparameters 
+and see how it performs on our test set.
+
+```{r}
+# Restore our Train_X t
+Train_x <- Train_x_sequence_secondarystruc 
+
+# And the input shape
+input_shape = c(133,23)
+
+model_final <- keras_model_sequential()
+  model_final %>%
+  layer_conv_1d(filters = 64, kernel_size = c(11), strides = 1, input_shape = input_shape, padding = "same")  %>%
+  layer_activation_relu() %>%
+  layer_dropout(rate = 0.6) %>%
+  layer_conv_1d(filters = 16, kernel_size = c(7), strides = 1, padding = "same")  %>%
+  layer_activation_relu() %>%
+  layer_dropout(rate = 0.6) %>%
+layer_flatten()%>%
+
+  layer_dense(units = 16) %>%
+  layer_activation_relu() %>%
+  layer_dropout(rate = 0.6) %>%
+
+  
+    layer_dense(units = 1, activation = 'sigmoid')
+   
+model_final %>% compile(
+  optimizer = 'adam',
+  loss = 'binary_crossentropy',
+  metrics = list('accuracy')
+)
+
+# Train model
+model_final %>% fit(
+  Train_x, Train_y, verbose = 2,
+  batch_size = 32,
+  epochs = 25,
+  class_weight = class_weight)
+
+# And store the model so we can use this exact model again with the same weights
+model_final %>% save_model_tf("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/finalModel/1hSeqStruc2C1D")
+model_final <- load_model_tf("/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/finalModel/1hSeqStruc2C1D")
+# And we can run the predicitons on our training set!
+pred <- predict_classes(model_final, Test_x)
+# List to store performance measures so we can save them
+testSetPerformance <- list()
+# Confusion matrix
+testSetPerformance <- caret::confusionMatrix(as.factor(pred), as.factor(Test_y), mode = "everything", positive = "1")
+testSetPerformance
+# MCC 
+testSetPerformance$MCC <- mlr3measures::mcc(as.factor(Test_y),as.factor(pred), positive = "1")
+testSetPerformance$MCC
+# And add which sequences were correcly predicted etc
+# Combine sequences with hemo info and prediction
+testSequences <- data.frame(sequences[sequences %in% trainTest[["test"]]], Test_y, pred)
+colnames(testSequences) <- c("Sequences", "Hemolytic", "Prediction")
+# Add if class was predictied correcly or incorrect
+testSequences$PredictionCorrect <- "Incorrect"
+testSequences[testSequences$Hemolytic == testSequences$Prediction,4] <- "Correct"
+# Store
+testSetPerformance$predictionResults <- testSequences
+# Store performance
+saveRDS(testSetPerformance, "/home/jeppe/Dropbox/internship_TNO/R/4_CNN1h/1hSeqStruc2C1D_testSetPerformance.rds")
+```

@@ -1,0 +1,407 @@
+# Libraries
+```{r}
+library(caret)
+library(doParallel)
+library(parallel)
+library(dplyr)
+library(MLmetrics)
+requireNamespace("mlr3measures")
+library(kernlab)
+library(reshape2)
+library(ggplot2)
+library(ggsci)
+```
+
+From the random forest we move on to the SVM. Again we will load our dataset and
+now we will also apply scaling. Furthermore the data will be again split in train
+and test, with caret to be used to run 10 fold cv on the training set to determine
+what features to use and the best hyperparameters. 
+
+First let us load our hemo_df
+```{r}
+hemo_df <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+cat("Pos/hemolytic: ")
+length(which(hemo_df$Hemolytic == 1))
+cat("Neg/non-hemolytic: ")
+length(which(hemo_df$Hemolytic == 0))
+```
+
+Now we will prepare our data to be used for the SVM. SVM works better on
+scaled data, which is logical if you consider how SVM works. So we will also scale
+and center.
+
+```{r}
+# Remove some columns that we dont need
+hemo_df$X <- NULL
+hemo_df$Source <- NULL
+
+# And our character columns have to be factors for the SVM library to work
+hemo_df$Hemolytic <- as.factor(make.names(factor(hemo_df$Hemolytic)))
+hemo_df <- hemo_df %>% mutate_if(is.character, as.factor) 
+# Set correct order for positive and negative in performance measuers
+hemo_df$Hemolytic <-factor(hemo_df$Hemolytic, levels = rev(levels(hemo_df$Hemolytic))) 
+
+train_test <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+SVM_train <- hemo_df[hemo_df$Sequence %in% train_test[["train"]],]
+SVM_train$Sequence <- NULL
+SVM_test <- hemo_df[hemo_df$Sequence %in% train_test[["test"]],]
+SVM_test_sequences <- as.character(SVM_test$Sequence)
+SVM_test$Sequence <- NULL
+```
+
+And we scale and center the data, Since we assume the train set to be a 
+representativerepresentation of the population any transoformation we make to it 
+should be applicable to our test set also. Scaling and centering will thus be based
+on our training set. Also, this gives us a way to scale/center new unseen peptides
+that we could use as extra external test peptides.
+
+```{r}
+preproc <- preProcess(SVM_train, method = c("scale", "center")) 
+SVM_train <- predict(preproc, SVM_train)
+SVM_test <- predict(preproc, SVM_test)
+```
+
+Again, we have our 427 features as input (Intrachain bonds, cyclic/linear, AAC, DC,
+SSC). We will see which combination of features performs the best. 
+
+There are a lot of different combinations to make, but to keep it computional
+doable I have chosen for:
+
+AAC
+DC
+AAC + DC
+AAC + SSC
+DC + SSC
+AAC + DC + SSC
+
+intrachain bonds and cyclic/linear info are always included.
+
+We will train a radial SVM on the different combinations of features. I choose a
+radial SVM baded on other literature around peptide predictions.
+A grid search will be used in combination with 10-fold cv to determine the best
+performing hyperparameters.
+
+First create function so we can expand performance measures of Caret beyond only accuracy and kappa
+```{r}
+MySummary  <- function(data, lev = NULL, model = NULL){
+  # data is our input datat that cerat created, this is the format it expects, 
+  # the other variables we don;t use but need to establish = NULL
+  a <- defaultSummary(data, lev, model) #Accuracy, Kappa
+  sens <- sensitivity(data[, "pred"], data[, "obs"], 
+    lev[1])
+  spec <- specificity(data[, "pred"], data[, "obs"], 
+    lev[2])
+  b <- c(sens,spec)
+  names(b) <- c("Sens", "Spec")
+  c <- prSummary(data, lev, model)# Auc, Prec, recall, f1
+  d <- mlr3measures::mcc(data[, "obs"], data[, "pred"], positive = "X1") #mcc
+  names(d) <- "mcc" #MCC
+  out <- c(a, b, c, d) #combine
+  out}
+```
+
+Now let's do a grid search with the different combinations combined with a 10-fold
+cv. For grid search we need to determine a good sigma and cost. For the sigma I 
+will use sigest function, which estimates a lower and upper bound of well 
+performing sigma. How this is done can be found in the package documentation. I
+will use 20 values between the upper and lower bound given by this function. For
+cost or C I have noticed that values between 1 and 40 work well from earlier
+iterative toying around with the radial SVM for this dataset. The search grid
+from this will be 800 combinations which I will downsample to 100 to keep it 
+computationally doable.
+  
+
+```{r}
+# Parallellise to speed up
+cl <- makeCluster(6) 
+registerDoParallel(cl)
+
+# Cost
+cost <- 1:40
+
+# AAC
+
+# Calculate ok sigma range
+tempTrain <- SVM_train[,c(1:4, 8:27)]
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = tempTrain, scaled = FALSE)
+# Take 20 steps between these ranges, including lower and upper bound themself
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+# create training grid, sample to 100 combinations
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+# Train radial SVM
+svmTemp <- train(Hemolytic  ~ ., data = tempTrain,
+                    method = "svmRadial", # SVM radial from kernlab package
+                    # 10 fold cross validation, 0.25 will be valid set
+                    # use my own summary function to get more perf. meas.
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = F,
+                                                 summaryFunction = MySummary,
+                                             verboseIter = TRUE
+                    ),
+                    # Hyper parameters to sample
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_AAC.rds")
+
+# AAC + SSC
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = SVM_train[,c(1:27)], scaled = FALSE)
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+svmTemp <- train(Hemolytic  ~ ., data = SVM_train[,c(1:27)],
+                    method = "svmRadial", 
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = F,
+                                                 summaryFunction = MySummary
+                    ),
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_AAC_SSC.rds")
+
+# DC
+tempTrain <- SVM_train[,c(1:4, 28:427)]
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = tempTrain, scaled = FALSE)
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+svmTemp <- train(Hemolytic  ~ ., data = tempTrain,
+                    method = "svmRadial", 
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = F,
+                                                 summaryFunction = MySummary
+                    ),
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_DC.rds")
+
+# DC + SSC
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = SVM_train[,c(1:7, 28:427)], scaled = FALSE)
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+svmTemp <- train(Hemolytic  ~ ., data = SVM_train[,c(1:7, 28:427)],
+                    method = "svmRadial", 
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                    ),
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_DC_SSC.rds")
+
+# AAC + DC
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = SVM_train[,c(1:4, 8:427)], scaled = FALSE)
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+svmTemp <- train(Hemolytic  ~ ., data = SVM_train[,c(1:4, 8:427)],
+                    method = "svmRadial", 
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                    ),
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_AAC_DC.rds")
+
+# AAC + DC + SSC
+sigma <- kernlab::sigest(Hemolytic  ~ ., data = SVM_train[,c(1:427)], scaled = FALSE)
+sigma <- seq(from = sigma[1], 
+             to = sigma[3], 
+             length.out = 20)
+tgrid = expand.grid(sigma = sigma, C = cost)
+tgrid <- tgrid[sample(nrow(tgrid), 100),]
+svmTemp <- train(Hemolytic  ~ ., data = SVM_train[,c(1:427)],
+                    method = "svmRadial", 
+                    trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                    ),
+                    tuneGrid = tgrid)
+saveRDS(svmTemp, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/svmModel_AAC_DC_SSC.rds")
+
+stopCluster(cl)
+```
+
+Get the results of the above runs
+
+```{r}
+# List out rfModels from above
+svmModels <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/",
+    pattern = ".rds",
+    full.names = T
+  )
+# Read in the .rds files
+svmModels <- lapply(svmModels, function(x) readRDS(x))
+# Set names to something sensisble
+names(svmModels) <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/",
+    pattern = ".rds",
+    full.names = F
+  )
+
+# Get results in a nice table. Find model with the highest MCC
+# First get a list with for each model the performance measures for the best 
+# performing model as per the MCC. 
+resultsList <- lapply(1:length(svmModels), function(i){
+  # Fix an error I made with naming of perf. parameters sens and spec
+  # I have fixed this halfway in the runs performed above by adding 
+  # names(b) <- c("Sens", "Spec") to MySummary() but basically
+  # Sens and Spec got named V3 and V4 before I did this.
+  # obviously I dont want to rerun all these runs so I fix it here
+  names(svmModels[[i]][["results"]]) <- gsub("V3", "Sens", names(svmModels[[i]][["results"]]))
+  names(svmModels[[i]][["results"]]) <- gsub("V4", "Spec", names(svmModels[[i]][["results"]]))
+  # Which one has highstest MCC?
+  best <- which(max(svmModels[[i]][["results"]][["mcc"]]) == svmModels[[i]][["results"]][["mcc"]])
+  # Find performance measures for this best performing model
+  df <- t(data.frame(c(
+    # Features used
+    names(svmModels[i]),
+    # Performance measures
+    svmModels[[i]][["results"]][["mcc"]][best], 
+    svmModels[[i]][["results"]][["mccSD"]][best],
+    svmModels[[i]][["results"]][["Sens"]][best],
+    svmModels[[i]][["results"]][["SensSD"]][best],
+    svmModels[[i]][["results"]][["Spec"]][best],
+    svmModels[[i]][["results"]][["SpecSD"]][best],
+    svmModels[[i]][["results"]][["Accuracy"]][best],
+    svmModels[[i]][["results"]][["AccuracySD"]][best],
+    # Which hyperparameters gave these svmModels?
+    svmModels[[i]][["results"]][["sigma"]][best],
+    svmModels[[i]][["results"]][["C"]][best]
+    )))
+  rownames(df) <- NULL
+  return(df)
+})
+# Get resuls into a df
+resultsDf <-
+  data.frame(matrix(
+    unlist(resultsList),
+    nrow = length(resultsList),
+    byrow = T
+  ), stringsAsFactors = FALSE)[]
+
+  # Add colnames
+colnames(resultsDf) <- c("Features", "MCC", "MCC_SD", "Sens", "SensSD", "Spec", "SpecSD", "Acc", "AccSD", "sigma", "Cost") 
+
+resultsDf
+```
+
+Now let's visualise the results
+
+```{r}
+# "Melt" the df so ggplot can use it
+resultsDf <- melt(resultsDf, id.vars = "Features")
+# Drop the rows with cost and sigma
+resultsDf <- resultsDf[1:48,]
+# Split SD and values
+# Which rows have SD?
+sdRows <- grep(pattern = "SD", resultsDf[,2])
+# Cbind the split sets
+resultsDf <- cbind(resultsDf[-sdRows,], resultsDf[sdRows, 2:3])
+
+# Values need to be numeric obviously
+resultsDf[,c(3)] <- as.numeric(resultsDf[,c(3)])
+resultsDf[,c(5)] <- as.numeric(resultsDf[,c(5)])
+# Change names to something sensible
+names(resultsDf) <- c("Features", "Variable", "Value", "SD_Variable", "SD")
+```
+
+And plot 
+
+```{r}
+# Plot
+p1 <- ggplot(resultsDf,
+       aes(
+         x = Features,
+         ymin = Value - SD,
+         ymax = Value + SD,
+         fill = Variable
+       )) +
+  geom_bar(
+    aes(y = Value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(width = .2,
+                colour = "black",
+                position = position_dodge(width = 0.9)) +
+  ggtitle("Performance measures 10-fold CV SVM") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+If we change the grouping around it gets easier to compare between
+features
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+p2 <- ggplot(resultsDf, aes(x = Variable, ymin=Value-SD, ymax=Value+SD, fill = Features)) +   
+  geom_bar(aes(y = Value), colour = "black", position = "dodge", stat="identity", width=0.9) + 
+  scale_y_continuous(name="Value", limits= 0:1) +
+  geom_errorbar(width=.2, colour = "black", position = position_dodge(width=0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+ scale_fill_jco() 
+p2
+```
+
+Finally, the best model. This is the combination of the intrachainbond, N/C-term
+modifications, DC and SSC features. With cost = 3 and sigma = 0.00271890167310426
+This model was chosen based on MCC.
+
+```{r}
+# Train model on full training set with the best found features and hyperparameters
+# Kernel is radial and classification as type
+bestSvmModel <- ksvm(Hemolytic ~ ., data = SVM_train[,c(1:7, 28:427)],
+                     kernel = "rbfdot", type = "C-svc", 
+                     C = 3, kpar = list(sigma = 0.00271890167310426))
+
+# Store model so we can reference to this exact model and reuse it
+### saveRDS(bestSvmModel, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/finalModel/bestSvmModel.rds")
+bestSvmModel <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_models/finalModel/bestSvmModel.rds")
+# Predict for the test set
+pred <- predict(bestSvmModel, SVM_test)
+
+# List to store performance measures so we can save them
+testSetPerformance <- list()
+# Confusion matrix
+testSetPerformance <- confusionMatrix(pred, as.factor(SVM_test$Hemolytic), positive = "X1")
+testSetPerformance
+# MCC
+cat("\nMCC: ")
+testSetPerformance$MCC <- mlr3measures::mcc(as.factor(SVM_test$Hemolytic), pred, positive = "X1")
+testSetPerformance$MCC
+
+# And we find which sequences were correctly and wrongly predicted
+# Add hemo info and prediction results to test sequences we saved at the start
+SVM_test_sequences <- data.frame(SVM_test_sequences, as.character(SVM_test$Hemolytic))
+colnames(SVM_test_sequences) <- c("Sequences", "Hemolytic")
+# Add the predicted class
+SVM_test_sequences$Prediction <- as.character(pred)
+# Add if prediction was correct or incorrect
+SVM_test_sequences$PredictionCorrect <- "Incorrect"
+SVM_test_sequences[SVM_test_sequences$Hemolytic == SVM_test_sequences$Prediction,4] <- "Correct"
+# Store in list
+testSetPerformance$predictionResults <- SVM_test_sequences
+# Store performance
+saveRDS(testSetPerformance, "/home/jeppe/Dropbox/internship_TNO/R/3_SVM/SVM_testSetPerformance.rds")
+```

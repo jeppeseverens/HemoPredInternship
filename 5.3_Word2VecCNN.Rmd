@@ -1,0 +1,839 @@
+# Libraries
+```{r}
+library(keras)
+library(Matrix)
+library(tensorflow)
+library(caret)
+library(tfruns)
+library(parallel)
+library(doParallel)
+requireNamespace("mlr3measures")
+library(reshape2)
+library(ggsci)
+```
+
+# CNN for word2vec learned feature representations 1grams
+We now have our matrices of 133 by 100 per peptide, with for each amino acid
+and the secondary structure it is located in a learned numerical vector. We will
+use our training set to train a CNN running over these matrices to learn to classify
+hemolytic and non-hemolytic peptides. 
+
+Let's start by loading the datasets, getting train and test sets and setting up
+the right data format. Due to time constriants I am dropping the window 5 and 15 
+models for now.
+
+```{r}
+# Load our dataset
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix1gram.rds")
+
+# These datasets now contains sparse Matrix matrices, which are much smaller.
+# Just as an example I will show how the CNN below was set up
+# After which I wil use tensorflow train scripts to run over all three sets of 
+# 1 gram matrices I haved
+dataset <- datasetList[[3]]
+
+# Load our train/test splits
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 133, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+gc()
+
+# Input shape
+input_shape <- c(133, 100)
+
+# Weights because our dataset is unbalanced
+weight_1 <- as.numeric(table(Train_y)[1]/table(Train_y)[2])
+class_weight <- list("0" = 1, "1" = weight_1)
+```
+
+Here I show an example model, I came to this model through an iterative process. 
+This model was heavily inspired by 
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-019-3006-z
+and
+https://arxiv.org/pdf/1408.5882v2.pdf
+
+I will run this in 5-fold cross validation as 
+in the one hot encoded CNNs.
+
+```{r}
+# Set mode to sequential, this is a mode to build Keras models with %>% calls
+# Keras/TF does not need to store your model with <-, confusing but it is what
+# it is.
+
+# Shuffle training data, keras just takes the last 20% of the set as validation
+# but the data is sorted by aminoacid sequence characters. Does not really give
+# a good representive validation set if you just take 20% last sequences.
+set.seed(1234741)
+sample <- sample(length(Train_y), 0.75*length(Train_y))
+# Engage model
+model <- keras_model_sequential()
+
+# Set up our model
+model %>%
+  # Convolution part
+  layer_conv_1d(
+    filters = 64,  #  Number of filters of the conv. layer
+    kernel_size = c(8),  # Window size
+    strides = 1,  # Step size
+    input_shape = input_shape,  # Input shape
+    padding = "valid",  # Padding so our array length keeps at 133 
+  )  %>% 
+  
+  layer_batch_normalization() %>%  # Batch normalisation to prevent overfit
+  layer_activation_relu() %>% # Activation layer
+  layer_dropout(rate = 0.6) %>%  # Dropout layer
+  layer_max_pooling_1d()  %>%
+  
+  layer_flatten() %>%  # Flatten so dense layer can handle it
+  
+  # Dense layer part (fully connected layer is also a term that is used)
+  layer_dense(units = 8) %>%   # Number of nodes in the dense layer
+  layer_activation_relu() %>%  # Activtation
+  layer_batch_normalization() %>%   # Batch normalisation
+  layer_dropout(rate = 0.6) %>% # Dropout
+  
+  # Activation layer
+  layer_dense(units = 1, activation = 'sigmoid')  # Activation layer
+
+# Here we set up how the model should be optimized, we will use the
+# Adam optimizer which works well for binary data, and the binary_crossentropy
+# loss function because we are working with binary classification
+# We set the evaluation metric to accuracy, but we won't really use it
+model %>% compile(optimizer = 'adam',
+                        loss = 'binary_crossentropy',
+                        metrics = list('accuracy'))
+
+# And we train the model, batch size 32 because that is standard number
+# We let keras take a part of the training data as validation split
+# and we set out class weights here
+# Callback_early_stopping will monitor the loss of the validation_set and stop
+# if it does not lower for 10 steps
+model %>% fit(
+  Train_x[sample,,],
+  Train_y[sample],
+  verbose = 1,
+  epochs = 250,
+  batch_size = 16,
+  validation_data =  list(Train_x[-sample, , , drop = FALSE], Train_y[-sample]),
+  class_weight = class_weight,
+  callbacks = list(callback_early_stopping(monitor = "val_loss", min_delta = 1e-04, patience = 10))
+)
+
+ pred <- predict_classes(model, Train_x[-sample, , , drop = FALSE])
+ caret::confusionMatrix(as.factor(pred),
+                           as.factor(Train_y[-sample]),
+                           mode = "everything",
+                           positive = "1")
+```
+
+Let's see if we can push those numbers with hyperparameter selection. I have created
+a script like with the one hot encoded CNN. Traintf will run through it and we can see
+afterwards which combination of hyperparameters worked the best.
+
+I will run this through 7 possible representations
+
+1-grams 100 dim, window 25, sequence and secondary structure
+  -combined dataset
+  -hemo dataset
+  -porter5 dataset
+2-grams 100 dim, window 25, sequence and secondary structure
+  -combined dataset
+  -hemo dataset
+3-grams, 100 dim, windows 25, sequence only
+  -ProtVec
+  -hemo dataset
+        
+
+1 grams and combined dataset
+
+```{r}
+# Set correct map structure
+features <- "combined1Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+1 grams and hemo dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix1gram.rds")
+
+dataset <- datasetList[[6]]
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 133, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+
+# Set correct map structure
+features <- "hemo1Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+1 grams and porter5 dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix1gram.rds")
+
+dataset <- datasetList[[9]]
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 133, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+# Set correct map structure
+features <- "porter1Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+2 grams and combined dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix2Gram.rds")
+
+dataset <- datasetList[[3]]
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 132, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Input shape
+input_shape <- c(132, 100)
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+# Set correct map structure
+features <- "combined2Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+2 grams and hemo dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix2Gram.rds")
+
+dataset <- datasetList[[6]]
+
+# Load our train/test splits
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/train_test_sequences_17_july_new.rds")
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 132, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Input shape
+input_shape <- c(132, 100)
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+# Set correct map structure
+features <- "hemo2Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+3 grams ProtVec
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix3GramsAAComparison.rds")
+
+dataset <- datasetList[[1]]
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 131, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Input shape
+input_shape <- c(131, 100)
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+# Set correct map structure
+features <- "protvecAA3Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+3-grams hemo dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix3GramsAAComparison.rds")
+
+dataset <- datasetList[[2]]
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 131, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+#test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+#test_y <- y[sequences %in% trainTest[["test"]]]
+
+# Input shape
+input_shape <- c(131, 100)
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+# Set correct map structure
+features <- "hemoAA3Gram100Dim25Window"
+
+# Run grid search
+runs <-
+  tuning_run(
+    "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/trainScripts/word2vecTrain.R",
+   flags = list(
+      dropout = c(0.6),
+      layer1_filters = c(32, 64, 128),
+      layer2_units = c(8, 16, 32,64),
+      kernel_size1 = c(4,6,7,8,9,10),
+      batch_size = c(16)
+    ),
+    sample = 1,
+    echo = FALSE,
+    confirm = TRUE
+  )
+```
+
+Now lets see which representation worked best. We get our df with the performance
+measures of all the above 5-fold cv runs.
+
+```{r}
+# Input:
+# result is an list of results we get from our scripts
+# kfolds is the number of k fold cross validarion we used, in our case always 5
+# Output is a dataframe with performance measures and the hyperparameters used
+
+getCnnCvResults <- function(result, kfolds){
+  kfolds <- 1:kfolds  # number of folds
+  flags <- result[["flags"]] # store flags so we know what hyperparameters we used
+  performanceDf <- as.data.frame(t(data.frame(flags))) #df to bind information to
+  rownames(performanceDf) <- NULL
+  
+  # All kinds of performance measures
+  # We take the mean and the standard deviation (sd)
+  performanceDf$mcc <- mean(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["mcc"]])))
+  performanceDf$mccSD <- sd(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["mcc"]])))
+  performanceDf$sens <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Sensitivity"]])))
+  performanceDf$sensSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Sensitivity"]])))
+  performanceDf$spec <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Specificity"]])))
+  performanceDf$specSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Specificity"]])))
+  performanceDf$acc <- mean(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["overall"]][["Accuracy"]])))
+  performanceDf$accSD <- sd(unlist(lapply(kfolds, function(x) result[["valid_parameters"]][[x]][["overall"]][["Accuracy"]])))
+  performanceDf$prec <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Precision"]])))  
+  performanceDf$precSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Precision"]])))
+  performanceDf$recall <- mean(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Recall"]])))
+  performanceDf$recallSD <- sd(unlist(lapply(kfolds, function(x)result[["valid_parameters"]][[x]][["byClass"]][["Recall"]])))
+  
+  # Return our df
+  return(performanceDf)
+}
+
+# List the folders with feature names
+featuresDirs <- dir("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/cnn_models/", pattern = "Window", full.names = TRUE)
+
+# For each folder, we get the .rds files that contain the 5-fold cv results
+# and read in the RDS. We run getCnnCvResults to get the average and sd of each
+# performance measure. We will then have for each feature a df with performance 
+# measures and the hyperparameters.
+resultsList <- lapply(featuresDirs, function(x){
+  # List files for the specific feature folder
+results <- list.files(x, ".rds", full.names = TRUE)
+# read in all the .rds files with performance measures
+results <- lapply(results, function(x) readRDS(x))
+# extract mean and sd
+resultsTemp <-
+  mclapply(results,
+           getCnnCvResults,
+           kfolds = 5,
+           mc.cores = 6)
+collumNames <- colnames(resultsTemp[[1]]) #  Set colnames to something sensible
+resultsTemp <-
+  data.frame(matrix(
+    unlist(resultsTemp),
+    nrow = length(resultsTemp),
+    byrow = T
+  ), stringsAsFactors = FALSE) # Create from the outputted list a df
+colnames(resultsTemp) <- collumNames #  Set colnames
+return(resultsTemp)
+}) 
+# Add sensible names to each df in the list
+names(resultsList) <-
+  dir("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/cnn_models/", pattern = "Window",
+      full.names = FALSE)
+# Now we will get for each feature the best performing hyperparameters and 
+# performance measures. Best performing models means the one with the highest MCC
+bestResultsList<- lapply(1:length(resultsList), function(i){
+ # Which entry has highest MCC?
+  best <-
+    which(max(resultsList[[i]][["mcc"]]) == resultsList[[i]][["mcc"]])
+  df <- t(data.frame(
+    c(names(resultsList[i]),
+      resultsList[[i]][["mcc"]][best],
+      resultsList[[i]][["mccSD"]][best],
+      resultsList[[i]][["sens"]][best],
+      resultsList[[i]][["sensSD"]][best],
+      resultsList[[i]][["spec"]][best],
+      resultsList[[i]][["specSD"]][best],
+      resultsList[[i]][["acc"]][best],
+      resultsList[[i]][["accSD"]][best],
+      resultsList[[i]][["Dropout"]][best],
+      resultsList[[i]][["Filter1"]][best],
+      resultsList[[i]][["Nodes1"]][best],
+      resultsList[[i]][["Window1"]][best]
+    )
+  ))
+  rownames(df) <- NULL # rownames make no sense here
+  return(df)
+})
+
+resultsDf <-
+  data.frame(matrix(
+    unlist(bestResultsList),
+    nrow = length(bestResultsList),
+    byrow = T
+  ), stringsAsFactors = FALSE)
+colnames(resultsDf) <-
+  c(
+    "Features",
+    "MCC",
+    "MCC_SD",
+    "Sens",
+    "SensSD",
+    "Spec",
+    "SpecSD",
+    "Acc",
+    "AccSD",
+    "Dropout",
+    "Filter",
+    "Nodes",
+    "Window"
+  )
+
+resultsDf
+```
+
+Interesting how this is the only set of features where adding secondary structure
+does not increase performance per se
+
+Lets visualise those results. First edit DF
+```{r}
+# Melt df
+resultsDf <- melt(resultsDf, id.vars = "Features")
+# Remove rows we dont need with hyperparameter info
+resultsDf <- resultsDf[1:56,]
+# Which rows have SD?
+sdRows <- grep(pattern = "SD", resultsDf[,2])
+# Cbind the split sets
+resultsDf <- cbind(resultsDf[-sdRows,], resultsDf[sdRows, 2:3])
+# Values need to be numeric obviously
+resultsDf[,c(3)] <- as.numeric(resultsDf[,c(3)])
+resultsDf[,c(5)] <- as.numeric(resultsDf[,c(5)])
+# Change names to something sensible
+names(resultsDf) <- c("Features", "Variable", "Value", "SD_Variable", "SD")
+```
+
+And plot 
+
+```{r}
+# Plot
+p1 <- ggplot(resultsDf,
+       aes(
+         x = Features,
+         ymin = Value - SD,
+         ymax = Value + SD,
+         fill = Variable
+       )) +
+  geom_bar(
+    aes(y = Value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(width = .2,
+                colour = "black",
+                position = position_dodge(width = 0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+If we change the grouping around it gets easier to compare between
+features but looks less pretty. 
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+p2 <- ggplot(resultsDf, aes(x = Variable, fill = Features)) +
+  geom_bar(aes(y = Value),
+           colour = "black",
+           position = "dodge",
+           stat = "identity",
+           width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(
+    aes(ymin = Value - SD, ymax = Value + SD),
+    width = .2,
+    colour = "black",
+    position = position_dodge(0.9)
+  ) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco() 
+p2
+```
+
+And finally we can create our final model based on the hyperparameters and the 
+features that had the highest MCC, which was the 2grams of the hemo dataset
+
+```{r}
+# Load datasets
+datasetList <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesMatrix2Gram.rds")
+
+dataset <- datasetList[[6]]
+
+# Load our train/test splits
+trainTest <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+
+# First we make one array out of the matrices
+# Get all matrices and go from sparse Matrix to dense Matrix to matrix
+array <- lapply(1:length(dataset), function(x) as.matrix(Matrix(dataset[[x]][["word2vecMatrix"]], sparse = FALSE)))
+# Bind everything together so we can make array easily
+array <- do.call(rbind, array)
+# Make array, use array reshape since it is rowfirst
+array <- array_reshape(array, dim = c(length(dataset), 132, 100))
+
+# Get out sequences to make the train test split
+sequences <-  unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Sequence"]]))
+# Get our classes while we are at it
+y <- unlist(lapply(1:length(dataset), function(x) dataset[[x]][["Hemolytic"]]))
+
+# split x
+Train_x <- array[sequences %in% trainTest[["train"]],,]
+Test_x <- array[sequences %in% trainTest[["test"]],,]
+# split y
+Train_y <- y[sequences %in% trainTest[["train"]]]
+Test_y <- y[sequences %in% trainTest[["test"]]]
+# And test sequences for later
+testSequences <- sequences[sequences %in% trainTest[["test"]]]
+
+# Input shape
+input_shape <- c(132, 100)
+
+# Weights because our dataset is unbalanced
+weight_1 <- as.numeric(table(Train_y)[1]/table(Train_y)[2])
+class_weight <- list("0" = 1, "1" = weight_1)
+
+# Remove array, we need space + force garbage collection to free memory
+rm(array, datasetList, dataset)
+set.seed(1234741)
+# Engage model
+model <- keras_model_sequential()
+
+# Set up our model
+model %>%
+  # Convolution part
+  layer_conv_1d(
+    filters = 128,  #  Number of filters of the conv. layer
+    kernel_size = c(4),  # Window size
+    strides = 1,  # Step size
+    input_shape = input_shape,  # Input shape
+    padding = "valid",  # Padding so our array length keeps at 133 
+  )  %>% 
+  
+  layer_batch_normalization() %>%  # Batch normalisation to prevent overfit
+  layer_activation_relu() %>% # Activation layer
+  layer_dropout(rate = 0.6) %>%  # Dropout layer
+  layer_max_pooling_1d()  %>%
+  
+  layer_flatten() %>%  # Flatten so dense layer can handle it
+  
+  # Dense layer part (fully connected layer is also a term that is used)
+  layer_dense(units = 64) %>%   # Number of nodes in the dense layer
+  layer_activation_relu() %>%  # Activtation
+  layer_batch_normalization() %>%   # Batch normalisation
+  layer_dropout(rate = 0.6) %>% # Dropout
+  
+  # Activation layer
+  layer_dense(units = 1, activation = 'sigmoid')  # Activation layer
+
+# Here we set up how the model should be optimized, we will use the
+# Adam optimizer which works well for binary data, and the binary_crossentropy
+# loss function because we are working with binary classification
+# We set the evaluation metric to accuracy, but we won't really use it
+model %>% compile(optimizer = 'adam',
+                        loss = 'binary_crossentropy',
+                        metrics = list('accuracy'))
+
+# And we train the model, batch size 32 because that is standard number
+# We let keras take a part of the training data as validation split
+# and we set out class weights here
+# Callback_early_stopping will monitor the loss of the validation_set and stop
+# if it does not lower for 10 steps
+model %>% fit(
+  Train_x,
+  Train_y,
+  verbose = 1,
+  epochs = 20,
+  batch_size = 32,
+  class_weight = class_weight
+)
+# Store the exact model used so we can reuse it
+### model %>% save_model_tf("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/cnn_models/finalModel")
+```
+
+
+```{r}
+# Load model
+model <- load_model_tf("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/cnn_models/finalModel")
+
+# Predict the hemolytic activity of our test set
+pred <- predict_classes(model, Test_x)
+# List to store performance measures
+testSetPerformance <- list()
+# Use confusion matrix to get all kinds of performance measures on valid set
+testSetPerformance <-  caret::confusionMatrix(as.factor(pred),
+                           as.factor(Test_y),
+                           mode = "everything",
+                           positive = "1")
+testSetPerformance
+# Also get the mcc, which is not inclused in caret::confusionMatrix
+testSetPerformance$MCC <- mlr3measures::mcc(as.factor(Test_y), as.factor(pred), positive = "1")
+testSetPerformance$MCC
+# And add which sequences were correcly predicted etc
+# Combine sequences with hemo info and prediction
+testSequences <- data.frame(sequences[sequences %in% trainTest[["test"]]], Test_y, pred)
+colnames(testSequences) <- c("Sequences", "Hemolytic", "Prediction")
+# Add if class was predictied correcly or incorrect
+testSequences$PredictionCorrect <- "Incorrect"
+testSequences[testSequences$Hemolytic == testSequences$Prediction,4] <- "Correct"
+# Store
+testSetPerformance$predictionResults <- testSequences
+# Store the performance measures
+saveRDS(testSetPerformance, "/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/CNN_testSetPerformanceWord2vec.rds")
+```
+

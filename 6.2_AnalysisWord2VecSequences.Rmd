@@ -1,0 +1,592 @@
+```{r}
+library(ComplexHeatmap)
+library(uwot)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(Rtsne)
+library(RColorBrewer)
+library(ggthemes)
+library(dplyr)
+library(factoextra)
+library(parallel)
+library(doParallel)
+library(word2vec)
+library(viridis)
+library(dbscan)
+```
+
+Let's take a closer look at the word2vec features we have used
+
+```{r}
+# load our models
+modelSentences1gram <- read.word2vec("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/sentences1GramCombinedDim300Window25.bin")
+modelSentences2gram <- read.word2vec("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/sentences2gramCombinedDim300Window25.bin")
+```
+
+## Analysis of the embeddings
+3-grams of the primary structure only, I use the one from the hemolytic
+and non-hemolytic peptides. Let's see if it learned something
+```{r}
+embeddingsPrimStruc <- as.matrix(read.word2vec("/home/jeppe/Dropbox/internship_TNO/R/5_Word2Vec/Word2VecModels/modelHemoSequence3gram300Dim.bin"))
+
+# Create Umap so we can visually inspect how words relate to each other and guess clusters
+set.seed(200)
+
+# UMAP for 1grams
+umap3GramSeqFeatures <- umap(embeddingsPrimStruc, n_threads = 4)
+
+# Store in df for ggplot
+df3GramSeqFeaturesUmap  <- data.frame(word = gsub("//.+", "", rownames(embeddingsPrimStruc)), 
+                  xpos = gsub(".+//", "", rownames(embeddingsPrimStruc)), 
+                  x = umap3GramSeqFeatures[, 1], y = umap3GramSeqFeatures[, 2], 
+                  stringsAsFactors = FALSE)
+# Plot umap of 3 gram
+ggplot(df3GramSeqFeaturesUmap, aes(x = x, y = y)) +
+  geom_point() + theme_void()
+
+# TSNE for 3GramSeqs
+tsne3GramSeqFeatures <- Rtsne(embeddingsPrimStruc, pca_center = F, normalize = F, initial_dims = 10)
+# Store in df for ggplot
+df3GramSeqFeaturesTsne  <- data.frame(word = gsub("//.+", "", rownames(embeddingsPrimStruc)), 
+                  xpos = gsub(".+//", "", rownames(embeddingsPrimStruc)), 
+                  x = tsne3GramSeqFeatures[["Y"]][, 1], y = tsne3GramSeqFeatures[["Y"]][, 2], 
+                  stringsAsFactors = FALSE)
+# Plot
+ggplot(df3GramSeqFeaturesTsne, aes(x = x, y = y, label = word)) +
+  geom_point() + theme_void()
+```
+
+Lets see if these word2vec representations contain biological information
+
+```{r}
+# Dictionary for the hydrophobicity
+hydrophobicity <-
+  c(
+    "A" = 0.62,
+    "R" = -2.53 ,
+    "N" = -0.78,
+    "D" = -0.90,
+    "C" = 0.29,
+    "E" = -0.74,
+    "Q" = -0.85,
+    "G" = 0.48,
+    "H" = -0.40,
+    "I" = 1.38,
+    "L" = 1.06,
+    "K" = -1.5,
+    "M" = 0.64,
+    "F" = 1.19,
+    "P" = 0.12,
+    "S" = -0.18,
+    "T" = -0.05,
+    "W" = 0.81,
+    "Y" = 0.26,
+    "V" = 1.08
+  ) # JACS, 1962, 84: 4240-4246. (C. Tanford).
+hydrophilicy <-
+  c(
+    "A" = -0.5,
+    "R" = 3,
+    "N" = 0.2,
+    "D" = 3,
+    "C" = -1,
+    "E" = 3,
+    "Q" = 0.2,
+    "G" = 0,
+    "H" = -0.5,
+    "I" = -1.8,
+    "L" = -1.8,
+    "K" = 3,
+    "M" = -1.3,
+    "F" = -2.5,
+    "P" = 0,
+    "S" = 0.3,
+    "T" = -0.4,
+    "W" = -3.4,
+    "Y" = -2.3,
+    "V" = -1.5
+  ) # PNAS, 1981, 78:3824-3828 (T.P.Hopp & K.R.Woods)..
+
+charge <-
+  c(
+    "A" = 0,
+    "R" = 1,
+    "N" = 0,
+    "D" = -1,
+    "C" = 0,
+    "E" = -1,
+    "Q" = -0,
+    "G" = 0,
+    "H" = 1,
+    "I" = 0,
+    "L" = 0,
+    "K" = 1,
+    "M" = 0,
+    "F" = 0,
+    "P" = -0,
+    "S" = -0,
+    "T" = 0,
+    "W" = 0 ,
+    "Y" = 0,
+    "V" = 0
+  )
+mass <- # side chain mass!
+  c(
+    "A" = 15,
+    "R" = 101,
+    "N" = 58,
+    "D" = 59,
+    "C" = 47,
+    "E" = 73,
+    "Q" = 72,
+    "G" = 1,
+    "H" = 82,
+    "I" = 57,
+    "L" = 57,
+    "K" = 73,
+    "M" = 75,
+    "F" = 91,
+    "P" = 42,
+    "S" = 31,
+    "T" = 45,
+    "W" = 130 ,
+    "Y" = 107,
+    "V" = 43
+  )
+# Take sum of the above chemical properties for amino acids in a "word"
+chemicalPropertiesembPrimStruc <- t(as.data.frame(lapply(rownames(embeddingsPrimStruc), function(x){
+  aminoAcids <- str_split(x, simplify = TRUE, pattern = "")
+  return(c(sum(hydrophobicity[aminoAcids]), sum(hydrophilicy[aminoAcids]), sum(charge[aminoAcids]), sum(mass[aminoAcids])))
+})))
+
+# add row and colnames 
+rownames(chemicalPropertiesembPrimStruc) <- rownames(embeddingsPrimStruc)
+colnames(chemicalPropertiesembPrimStruc) <- c("Hydrophobicity", "Hydrophilicy","Charge", "Mass")
+
+# Umap
+# Plot
+p1 <- ggplot(df3GramSeqFeaturesUmap, aes(x = x, y = y, color = chemicalPropertiesembPrimStruc[,1])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D", labels=c("Minimum", "", "", "", "Maximum", "Maximum")) + ggtitle("Hydrophobicity") +
+  theme(plot.title = element_text(hjust = 0.5))
+p1[["labels"]][["colour"]] <- ""
+# Plot
+p2 <- ggplot(df3GramSeqFeaturesUmap, aes(x = x, y = y, color = chemicalPropertiesembPrimStruc[,2])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D")  + ggtitle("Hydrophilicy") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot
+p3 <- ggplot(df3GramSeqFeaturesUmap, aes(x = x, y = y, color = chemicalPropertiesembPrimStruc[,3])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D")  + ggtitle("Charge") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p4 <- ggplot(df3GramSeqFeaturesUmap, aes(x = x, y = y, color = chemicalPropertiesembPrimStruc[,4])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D")  + ggtitle("Mass") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggarrange(p1, p2, p3, p4, labels = c("A", "B", "C", "D"), common.legend = TRUE, legend = "right")
+```
+
+Lets analyse the 1-gram embeddings of the primary sequence and sec structure
+```{r}
+# Store our embeddings per "word" 
+embedding1Gram <- as.matrix(modelSentences1gram)
+
+# </s> is a stop signal, which is basically the end of the sentence. 
+# You would need this in a text
+# I see no reason to keep this for a peptide sequence, so: remove
+embedding1Gram <- embedding1Gram[-which(rownames(embedding1Gram) == "</s>"),]
+# Add space between amino acid and structure
+rownames(embedding1Gram) <- gsub("(^.)", "\\1 ", rownames(embedding1Gram))
+# Create Umap so we can visually inspect how words relate to each other and guess clusters
+set.seed(2)
+
+# UMAP for 1grams
+umap1GramFeatures <- umap(embedding1Gram, n_neighbors = 15, n_threads = 2, spread = 10)
+
+# Store in df for ggplot
+df1GramFeaturesUmap  <- data.frame(word = gsub("(^.)", "\\1 ", rownames(embedding1Gram)), 
+                  xpos = gsub(".+//", "", rownames(embedding1Gram)), 
+                  x = umap1GramFeatures[, 1], y = umap1GramFeatures[, 2], 
+                  stringsAsFactors = FALSE)
+# Plot umap of 1 gram
+ggplot(df1GramFeaturesUmap, aes(x = x, y = y, label = word)) +
+  geom_point() + geom_text_repel() + theme_void()
+
+# TSNE for 1grams
+tsne1GramFeatures <- Rtsne(embedding1Gram, perplexity = 10)
+# Store in df for ggplot
+df1GramFeaturesTsne  <- data.frame(word = gsub("(^.)", "\\1 ", rownames(embedding1Gram)), 
+                  xpos = gsub(".+//", "", rownames(embedding1Gram)), 
+                  x = tsne1GramFeatures[["Y"]][, 1], y = tsne1GramFeatures[["Y"]][, 2], 
+                  stringsAsFactors = FALSE)
+# Plot
+ggplot(df1GramFeaturesTsne, aes(x = x, y = y, label = word)) +
+  geom_point() + geom_text_repel() + theme_void()
+```
+
+Lets see where the chemical properties cluster, not that interesting for 1 grams
+since there is not much points to visualy analayse and to see where stuff clusters
+
+```{r}
+# Take mean of the above chemical properties for amino acids in a "word"
+# for a 1gram not that interesting
+chemicalPropertiesemb1Grams <- t(as.data.frame(lapply(rownames(embedding1Gram), function(x){
+  aminoAcids <- str_split(x, simplify = TRUE, pattern = "")
+  return(c(mean(hydrophobicity[aminoAcids[1]]),mean(hydrophilicy[aminoAcids[1]]), mean(charge[aminoAcids[1]]), mean(mass[aminoAcids[1]])))
+})))
+# add row and col naemes
+rownames(chemicalPropertiesemb1Grams) <- rownames(embedding1Gram)
+colnames(chemicalPropertiesemb1Grams) <- c("Hydrophobicity","Hydrophilicy", "Charge", "Mass")
+
+# Plot
+pp1 <- ggplot(df1GramFeaturesTsne, aes(x = x, y = y, label = word, color = chemicalPropertiesemb1Grams[,1])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D", labels=c("Minimum", "Minimum", "", "", "Maximum"))  + ggtitle("Hydrophobicity") +
+  theme(plot.title = element_text(hjust = 0.5))
+pp1[["labels"]][["colour"]] <- ""
+
+# Plot
+pp2 <-ggplot(df1GramFeaturesTsne, aes(x = x, y = y, label = word,color = chemicalPropertiesemb1Grams[,2])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D")   + ggtitle("Hydrophilicy") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Plot
+pp3 <-ggplot(df1GramFeaturesTsne, aes(x = x, y = y, label = word,color = chemicalPropertiesemb1Grams[,3])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D")  + ggtitle("Charge") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Plot
+pp4 <-ggplot(df1GramFeaturesTsne, aes(x = x, y = y, label = word,color = chemicalPropertiesemb1Grams[,4])) +
+  geom_point() + theme_void() +
+  scale_color_viridis(option = "D") + ggtitle("Mass") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggarrange(pp1,pp2, pp3, pp4, labels = c("A", "B", "C", "D"), common.legend = TRUE, legend = "right")
+```
+
+Let's add some metadata so we can maybe see some extra info
+
+```{r}
+# Add information about the 1-grams, simply what "c;ass" the amno acid belongs to
+df1GramFeaturesUmap$'Amino acid properties' <- "Hydrophobic"
+df1GramFeaturesUmap[grepl("S|T", x = df1GramFeaturesUmap$word),5] <- "Polar (positive)"
+df1GramFeaturesUmap[grepl("N|Q", x = df1GramFeaturesUmap$word),5] <- "Polar (negative)"
+df1GramFeaturesUmap[grepl("C|G|P", x = df1GramFeaturesUmap$word),5] <- "Special-cases"
+df1GramFeaturesUmap[grepl("R|H|K", x = df1GramFeaturesUmap$word),5] <- "Charge (positive)"
+df1GramFeaturesUmap[grepl("D|E", x = df1GramFeaturesUmap$word),5] <- "Charge (negative)"
+
+# Plot
+ggplot(df1GramFeaturesUmap, aes(x = x, y = y, label = word, color = df1GramFeaturesUmap[,5])) + theme_void() + scale_color_manual(values = c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#999999','#a65628','#f781bf','#999999')) +
+  labs(color = "Amino acid properties") + theme(legend.text=element_text(size=11)) +  coord_cartesian(clip = "off")+ 
+  geom_text_repel(segment.alpha = 0) + xlim(c(-40, 35))  + ylim(c(-40, 35))+ ggtitle("UMAP of the numerical features based on 1 grams") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+Three clear clusters of helix, sheet and coil, k = 3? Let's see what clustering 
+does.
+
+```{r}
+set.seed(1)
+# Kmeans clustering
+km1GramFeatures <- eclust(embedding1Gram, "kmeans", iter.max = 25)
+fviz_gap_stat(km1GramFeatures$gap_stat)
+fviz_silhouette(km1GramFeatures)
+
+# Hierarchical clustering
+hc1GramFeatures <- eclust(embedding1Gram, "hclust")
+fviz_dend(hc1GramFeatures, rect = TRUE)
+
+# Scatter plots of both clustering methods
+fviz_cluster(km1GramFeatures)
+fviz_cluster(hc1GramFeatures)
+```
+
+We can visualise this in a nice heat map, also good way to see that these numerical
+vectors per words have overlap and differences which you can cluster/classify with
+
+```{r}
+set.seed(1)
+# Heatmap, dont cluster columns and cluster rows to 3
+Heatmap(embedding1Gram, cluster_columns = FALSE, row_names_gp = gpar(fontsize = 8), show_column_dend = FALSE, show_row_dend = TRUE, row_km = 3, name = "1 Gram features\n", heatmap_legend_param = list(labels = c("Minimum", "", "", "", "Maximum")), column_title = "Heatmap of all numerical features based on 1 grams")
+```
+
+We can zoom in on three amino acids and their three classes
+
+```{r}
+# Order the data so rows are organised in heatmap
+order <- str_sort(grep("G .....?|L .....?|K .....?", rownames(embedding1Gram), value = TRUE))
+order <- sort(rownames(embedding1Gram[grepl("G .....?|L .....?|K .....?", rownames(embedding1Gram)),]))
+# Heatmap
+Heatmap(embedding1Gram[grepl("G .....?|L .....?|K .....?", rownames(embedding1Gram)),], cluster_rows = F, cluster_columns = FALSE, row_names_gp = gpar(fontsize = 11), row_order = order, row_split = c("Glycine","Leucine","Lysine","Leucine","Lysine","Leucine","Glycine","Lysine","Glycine"), name = "1 Gram features\n", heatmap_legend_param = list(labels = c("Minimum", "", "", "", "Maximum")), column_title = "Heatmap of the numerical features based on the 1 grams of glycine, \nleucine and lysine and secondary structures")
+```
+
+Lets do the same for the 2 grams, these are 3600 possible "word" representations
+instead of 60
+
+```{r}
+# Load matrix with words and their numerical vectors
+embedding2Gram <- as.matrix(modelSentences2gram)
+
+# </s> is a stop signal, which is basically the end of the sentence. 
+# You would need this in a text
+# I see no reason to keep this for a peptide sequence, so: remove
+embedding2Gram <- embedding2Gram[-which(rownames(embedding2Gram) == "</s>"),]
+
+set.seed(2)
+# Run Umap
+umap2GramFeatures <- umap(embedding2Gram, n_threads = 5)
+
+# Get in DF
+df2GramFeatureUmap  <- data.frame(word = gsub("//.+", "", rownames(embedding2Gram)), 
+                  xpos = gsub(".+//", "", rownames(embedding2Gram)), 
+                  x = umap2GramFeatures[, 1], y = umap2GramFeatures[, 2], 
+                  stringsAsFactors = FALSE)
+
+# Run TSNE
+tsne2GramFeatures <- Rtsne(embedding2Gram)
+
+# Get in DF
+df2GramFeatureTsne  <- data.frame(word = gsub("//.+", "", rownames(embedding2Gram)), 
+                  xpos = gsub(".+//", "", rownames(embedding2Gram)), 
+                  x = tsne2GramFeatures[["Y"]][, 1], y = tsne2GramFeatures[["Y"]][, 2], 
+                  stringsAsFactors = FALSE)
+
+# UMAP
+ggplot(df2GramFeatureUmap, aes(x = x, y = y)) +
+  geom_point()
+# TSNE
+ggplot(df2GramFeatureTsne, aes(x = x, y = y)) +
+  geom_point()
+```
+
+Lets add groups. I just use the 9 possible combinations of two times three classes
+as groups. Seemed the most obvious one to me. 
+
+```{r}
+df2GramFeatureUmap$Config <- "SheetSheet"
+df2GramFeatureUmap[grepl(".sheet.coil", x = df2GramFeatureUmap$word),5] <- "SheetCoil"
+df2GramFeatureUmap[grepl(".sheet.helix", x = df2GramFeatureUmap$word),5] <- "SheetHelix"
+df2GramFeatureUmap[grepl(".coil.coil", x = df2GramFeatureUmap$word),5] <- "CoilCoil"
+df2GramFeatureUmap[grepl(".coil.helix", x = df2GramFeatureUmap$word),5] <- "CoilHelix"
+df2GramFeatureUmap[grepl(".coil.sheet", x = df2GramFeatureUmap$word),5] <- "CoilSheet"
+df2GramFeatureUmap[grepl(".helix.helix", x = df2GramFeatureUmap$word),5] <- "HelixHelix"
+df2GramFeatureUmap[grepl(".helix.sheet", x = df2GramFeatureUmap$word),5] <- "HelixSheet"
+df2GramFeatureUmap[grepl(".helix.coil", x = df2GramFeatureUmap$word),5] <- "HelixCoil"
+```
+
+Also for tsne
+
+```{r}
+df2GramFeatureTsne$Config <- "SheetSheet"
+df2GramFeatureTsne[grepl(".sheet.coil", x = df2GramFeatureTsne$word),5] <- "SheetCoil"
+df2GramFeatureTsne[grepl(".sheet.helix", x = df2GramFeatureTsne$word),5] <- "SheetHelix"
+df2GramFeatureTsne[grepl(".coil.coil", x = df2GramFeatureTsne$word),5] <- "CoilCoil"
+df2GramFeatureTsne[grepl(".coil.helix", x = df2GramFeatureTsne$word),5] <- "CoilHelix"
+df2GramFeatureTsne[grepl(".coil.sheet", x = df2GramFeatureTsne$word),5] <- "CoilSheet"
+df2GramFeatureTsne[grepl(".helix.helix", x = df2GramFeatureTsne$word),5] <- "HelixHelix"
+df2GramFeatureTsne[grepl(".helix.sheet", x = df2GramFeatureTsne$word),5] <- "HelixSheet"
+df2GramFeatureTsne[grepl(".helix.coil", x = df2GramFeatureTsne$word),5] <- "HelixCoil"
+```
+
+
+```{r}
+# UMAP
+    ggplot(df2GramFeatureUmap, aes(x = x, y = y, color = Config)) +
+      geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a6cee3','#a65628','#f781bf','#999999')) + 
+      labs(color = "Secondary structures") + ggtitle("UMAP of the numerical features based on 2 grams") +
+      theme(plot.title = element_text(hjust = 0.5)) 
+# TSNE
+ggplot(df2GramFeatureTsne, aes(x = x, y = y, color = Config)) +
+  geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a6cee3','#a65628','#f781bf','#999999'))
+
+# Always looks cool, umap seems to show nice viual info
+```
+
+Lets see where the chemical properties cluster
+
+```{r}
+# Get the chemical properties for the 2 grams
+chemicalPropertiesemb2Grams <- t(as.data.frame(lapply(rownames(embedding2Gram), function(x){
+  aminoAcids <- str_split(x, simplify = TRUE, pattern = "")
+  aminoAcids <- grep("[A-Z]", aminoAcids, value = T)
+  return(c(mean(hydrophobicity[aminoAcids]),  mean(hydrophilicy[aminoAcids]),mean(charge[aminoAcids]), mean(mass[aminoAcids])))
+})))
+
+# add names
+rownames(chemicalPropertiesemb2Grams) <- rownames(embedding2Gram)
+colnames(chemicalPropertiesemb2Grams) <- c("Hydrophobicity", "Hydrophilicy","Charge", "Mass")
+
+# Umap
+# Plot
+ppp1 <- ggplot(df2GramFeatureUmap, aes(x = x, y = y, label = word, color = chemicalPropertiesemb2Grams[,1])) +
+  geom_point(size = 0.9) + theme_void() +
+  scale_color_viridis(option = "D", labels=c("Minimum","","", "Maximum")) +
+  theme(legend.position = "none") + ggtitle("Hydrophobicity") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  labs(color = "")
+
+# Plot
+ppp2 <- ggplot(df2GramFeatureUmap, aes(x = x, y = y, label = word,color = chemicalPropertiesemb2Grams[,2])) +
+  geom_point(size = 0.9) + theme_void() +
+  scale_color_viridis(option = "D")  + theme(legend.position = "none")+ ggtitle("Hydrophilicy") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot
+ppp3 <- ggplot(df2GramFeatureUmap, aes(x = x, y = y, label = word,color = chemicalPropertiesemb2Grams[,3])) +
+  geom_point(size = 0.9) + theme_void() +
+  scale_color_viridis(option = "D")  + theme(legend.position = "none") + ggtitle("Charge") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ppp4 <- ggplot(df2GramFeatureUmap, aes(x = x, y = y, label = word,color = chemicalPropertiesemb2Grams[,4])) +
+  geom_point(size = 0.9) + theme_void() +
+  scale_color_viridis(option = "D")  + theme(legend.position = "none") + ggtitle("Weight") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+ggarrange(ppp1,ppp2, ppp3, ppp4, labels = c("A", "B", "C", "D"), common.legend = TRUE, legend = "right")
+```
+  
+I have no idea how many clusters this might be
+We can create a heatmap but with 3600 rows there is not much to see
+
+```{r}
+set.seed(2)
+Heatmap(embedding2Gram, cluster_rows = F,cluster_columns = F, row_names_gp = gpar(fontsize = 0), show_column_dend = FALSE, show_row_dend = F, km = 1)
+```
+
+We can also visualise or even cluster the peptides we have based on the summed
+vector representations
+
+```{r}
+# Import 1 gram summed features
+dataset <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed1gram.rds")
+# Store the one from the combined (hemo + porter5) dataset
+dataset <- dataset[[3]]
+# Store hemolytic class and sequences
+Y <- dataset$Hemolytic
+sequence <- dataset$Sequence
+# Get our features per peptide in a matrix
+datasetHemoFrom1Grams <- as.matrix(dataset[,1:300])
+
+# Same for 2grams
+dataset <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/word2vecFeaturesSummed2gram.rds")
+dataset <- dataset[[3]]
+# Y and sequence are the same as above, no need to store
+
+# Get our features per peptide in a matrix
+datasetHemoFrom2Grams <- as.matrix(dataset[,1:300])
+
+rm(dataset)
+```
+
+Let's do visualisation of our peptides represented by the summed word2vec representations
+from 1grams:
+
+```{r}
+set.seed(2)
+
+# Run UMAP
+umap1GramPeptides <- umap(datasetHemoFrom1Grams, n_neighbors = 15, n_threads = 2)
+# Get in df for ggplot2
+df1GramPeptidesUmap  <- data.frame(x = umap1GramPeptides[, 1], y = umap1GramPeptides[, 2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot UMAP of peptides, colour by hemolytic class
+ggplot(df1GramPeptidesUmap, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+
+# Run tsne
+tsne1GramPeptides <- Rtsne(datasetHemoFrom1Grams, check_duplicates = FALSE)
+# Get in df for ggplot2
+df1GramPeptidesTsne <- data.frame(x = tsne1GramPeptides[["Y"]][, 1], y = tsne1GramPeptides[["Y"]][, 2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot TSNE of peptides, colour by hemolytic class
+ggplot(df1GramPeptidesTsne, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+```
+
+We can also try clustering
+
+```{r}
+set.seed(2)
+
+# Cluster with km
+km1GramPeptides10 <- eclust(datasetHemoFrom1Grams, "kmeans", iter.max = 25, k = 10)
+km1GramPeptides15 <- eclust(datasetHemoFrom1Grams, "kmeans", iter.max = 25, k = 15)
+km1GramPeptides20 <- eclust(datasetHemoFrom1Grams, "kmeans", iter.max = 25, k = 20)
+
+# Show clusters in umap
+ggplot(df1GramPeptidesTsne, aes(x = x, y = y, color = as.factor(km1GramPeptides10[["cluster"]]))) +
+  geom_point() 
+
+ggplot(df1GramPeptidesTsne, aes(x = x, y = y, color = as.factor(km1GramPeptides15[["cluster"]]))) +
+  geom_point() 
+
+ggplot(df1GramPeptidesTsne, aes(x = x, y = y, color = as.factor(km1GramPeptides20[["cluster"]]))) +
+  geom_point() 
+```
+
+```{r}
+# Clusters with dbscan
+kNNdistplot(as.matrix(datasetHemoFrom1Grams), k = 305)
+dbscan1gram <- dbscan(as.matrix(datasetHemoFrom1Grams), eps = 250, minPts = 305)
+
+# Umap
+ggplot(df1GramPeptidesTsne, aes(x = x, y = y, color = as.factor(dbscan1gram$cluster))) +
+  geom_point() 
+```
+
+Lets do the same for the peptides represented by the summed vectors of the 
+2-grams.
+
+```{r}
+set.seed(2)
+
+# Run UMAP
+umap2GramPeptides <- umap(datasetHemoFrom2Grams, n_threads = 2)
+# Get in df for ggplot2
+df2GramPeptidesUmap  <- data.frame(x = umap2GramPeptides[, 1], y = umap2GramPeptides[, 2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot UMAP of peptides, colour by hemolytic class
+ggplot(df2GramPeptidesUmap, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+
+# Run tsne
+tsne2GramPeptides <- Rtsne(datasetHemoFrom2Grams, check_duplicates = FALSE)
+# Get in df for ggplot2
+df2GramPeptidesTsne <- data.frame(x = tsne2GramPeptides[["Y"]][, 1], 
+                                  y = tsne2GramPeptides[["Y"]][, 2], hemo = Y,
+                  stringsAsFactors = FALSE)
+# Plot TSNE of peptides, colour by hemolytic class
+ggplot(df2GramPeptidesTsne, aes(x = x, y = y, color = hemo)) +
+  geom_point(size = 2) + theme_void() + scale_color_manual(values = c('#386cb0', '#e41a1c'))
+```
+
+Clustering
+
+```{r}
+set.seed(2)
+
+# Cluster with km
+km2GramPeptides10 <- eclust(datasetHemoFrom2Grams, "kmeans", iter.max = 25, k = 10)
+km2GramPeptides15 <- eclust(datasetHemoFrom2Grams, "kmeans", iter.max = 25, k = 15)
+km2GramPeptides20 <- eclust(datasetHemoFrom2Grams, "kmeans", iter.max = 25, k = 20)
+
+# Show clusters in umap
+ggplot(df2GramPeptidesUmap, aes(x = x, y = y, color = as.factor(km2GramPeptides10[["cluster"]]))) +
+  geom_point() 
+
+ggplot(df2GramPeptidesUmap, aes(x = x, y = y, color = as.factor(km2GramPeptides15[["cluster"]]))) +
+  geom_point() 
+
+ggplot(df2GramPeptidesUmap, aes(x = x, y = y, color = as.factor(km2GramPeptides20[["cluster"]]))) +
+  geom_point() 
+```
+
+This does not really seem to add anything of value

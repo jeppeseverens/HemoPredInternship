@@ -1,0 +1,490 @@
+
+# Libraries
+```{r}
+library(caret)
+library(ranger)
+library(doParallel)
+library(parallel)
+library(dplyr)
+requireNamespace("mlr3measures")
+library(reshape2)
+library(ggplot2)
+library(ggsci)
+```
+
+#Random Forest
+We will start of with the Random Forest. First let us load our hemo_df
+```{r}
+hemo_df <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+cat("Pos/hemolytic: ")
+length(which(hemo_df$Hemolytic == 1))
+cat("Neg/non-hemolytic: ")
+length(which(hemo_df$Hemolytic == 0))
+```
+
+We need to remove some columns, and we need to split our df in a train and test set. We will determine the best hyperparameters on the train set and validate our results on the test set.
+
+```{r}
+# Remove some columns that we dont need
+hemo_df$X <- NULL
+hemo_df$Source <- NULL
+
+# And our y column has to contain factors for the random forest library to work
+hemo_df$Hemolytic <- as.factor(make.names(factor(hemo_df$Hemolytic)))
+hemo_df <- hemo_df %>% mutate_if(is.character, as.factor) 
+# Set correct order for positive and negative in performance measuers
+hemo_df$Hemolytic <-factor(hemo_df$Hemolytic, levels = rev(levels(hemo_df$Hemolytic))) 
+
+train_test <- readRDS("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/trainTestSequences.rds")
+RF_train <- hemo_df[hemo_df$Sequence %in% train_test[["train"]],]
+RF_train$Sequence <- NULL
+RF_test <- hemo_df[hemo_df$Sequence %in% train_test[["test"]],]
+RF_test_sequences <- as.character(RF_test$Sequence)
+RF_test$Sequence <- NULL
+```
+
+Because our datasets are unblanced, I have added weights for each train sample 
+what the change for it to be sampled in the decision trees
+
+```{r}
+train_weights <- ifelse(RF_train$Hemolytic == "X1",
+                        (1/table(RF_train$Hemolytic)[1]) * 0.5,
+                        (1/table(RF_train$Hemolytic)[2]) * 0.5)
+```
+
+Now we have our 427 features as input (Intrachain bonds, cyclic/linear, AAC, DC,
+SSC). We will see which combination of features performs the best. 
+
+There are a lot of different combinations to thing up, but to keep it computional
+doable I have chosen for:
+
+AAC
+DC
+AAC + DC
+AAC + SSC
+DC + SSC
+AAC + DC + SSC
+
+intrachain bonds and cyclic/linear info are always included
+
+We will train the model with the train set, which gets split 10 times with 75% 
+train and 25% valid plus case weights to overcome class inbalance. Num of trees 
+is kept at 2000, which is simply a large but for my laptop also computationally 
+feasible number (https://arxiv.org/pdf/1705.05654.pdf). Different min.node.size
+and mtry will be sampled, to determine the best hyperparameters there. 
+
+First create function so we can expand performance measures of Caret beyond only accuracy and kappa
+```{r}
+MySummary  <- function(data, lev = NULL, model = NULL){#data is our input datat that cerat created, this is the format it expects, the other variables we don;t use but need to establish = NULL
+  a1 <- defaultSummary(data, lev, model) #Accuracy, Kappa
+  b1 <- twoClassSummary(data, lev, model) #ROC, sens., spec.
+  c1 <- prSummary(data, lev, model)# Auc, Prec, recall, f1
+  d1 <- mlr3measures::mcc(data[, "obs"], data[, "pred"], positive = "X1") #mcc
+  names(d1) <- "mcc" #MCC
+  out <- c(a1, b1, c1, d1) #combine
+  out}
+```
+
+Now we will train our models and get performance measures through 10-times cv.
+tgrid allows for a grid search. I sample the hyperparameters to speed things up.
+
+```{r}
+# Parallellise to speed up
+cl <- makeCluster(7) 
+registerDoParallel(cl)
+
+# AAC
+# Make trainings grid
+tgrid <- expand.grid(.mtry = 2:10, .splitrule = "gini", .min.node.size = 1:9)
+# Sample so we have so run less
+tgrid <- tgrid[sample(nrow(tgrid), 0.7 * nrow(tgrid)),]
+# Create model
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:4, 8:27)], # Select AAC collumns
+                        method = "ranger", #  Method RF from Ranger package
+                        # 10 fold cross validation, 0.25 will be valid set
+                        # use my own summary function to get more perf. meas.
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ),
+                        # Hyper parameters to sample
+                        tuneGrid = tgrid,
+                        # trees
+                        num.trees = 2000,
+                        importance = "impurity",
+                        # Weights so pos peptides get samples more since there are
+                        # less
+                        weights = train_weights)
+# Save results
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_AAC.rds")
+
+# And move on. etc.
+
+# AAC + SSC
+tgrid <- expand.grid(.mtry = 3:15, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.7 * nrow(tgrid)),]
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:27)],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_AAC_SSC.rds")
+
+# DC
+tgrid <- expand.grid(.mtry = 10:30, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:4, 28:427)],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_DC.rds")
+
+# DC + SSC
+tgrid <- expand.grid(.mtry = 10:30, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:7, 28:427)],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_DC_SSC.rds")
+
+# AAC + DC
+tgrid <- expand.grid(.mtry = 10:30, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:4, 8:427)],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_AAC_DC.rds")
+
+# AAC + DC + SSC
+tgrid <- expand.grid(.mtry = 10:30, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,c(1:427)],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+saveRDS(modelRF, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels/rfModel_AAC_DC_SSC.rds")
+
+stopCluster(cl)
+```
+
+Get the results of the above runs
+
+```{r}
+# List out rfModels from above
+rfModels <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels",
+    pattern = ".rds",
+    full.names = T
+  )
+# Read in the .rds files
+rfModels <- lapply(rfModels, function(x) readRDS(x))
+# Set names to something sensisble
+names(rfModels) <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModels",
+    pattern = ".rds",
+    full.names = F
+  )
+
+# Get results in a nice table. Find model with the highest MCC
+# First get a list with for each model the performance measures for the best 
+# performing model as per the MCC. 
+resultsList <- lapply(1:length(rfModels), function(i){
+  # Which one has highstest MCC?
+  best <- which(max(rfModels[[i]][["results"]][["mcc"]]) == rfModels[[i]][["results"]][["mcc"]])
+  # Find performance measures for this best performing model
+  df <- t(data.frame(c(
+    # Features used
+    names(rfModels[i]),
+    # Performance measures
+    rfModels[[i]][["results"]][["mcc"]][best], 
+    rfModels[[i]][["results"]][["mccSD"]][best],
+    rfModels[[i]][["results"]][["Sens"]][best],
+    rfModels[[i]][["results"]][["SensSD"]][best],
+    rfModels[[i]][["results"]][["Spec"]][best],
+    rfModels[[i]][["results"]][["SpecSD"]][best],
+    rfModels[[i]][["results"]][["Accuracy"]][best],
+    rfModels[[i]][["results"]][["AccuracySD"]][best],
+    # Which hyperparameters gave these rfModels?
+    rfModels[[i]][["results"]][["mtry"]][best],
+    rfModels[[i]][["results"]][["min.node.size"]][best]
+    )))
+  rownames(df) <- NULL
+  return(df)
+})
+# Get resuls into a df
+resultsDf <-
+  data.frame(matrix(
+    unlist(resultsList),
+    nrow = length(resultsList),
+    byrow = T
+  ), stringsAsFactors = FALSE)
+
+# Add colnames
+colnames(resultsDf) <- c("Features", "MCC", "MCC_SD", "Sens", "SensSD", "Spec", "SpecSD", "Acc", "AccSD", "Mtry", "min.node.size") 
+
+resultsDf
+```
+As we can see the combination of AAC, DC and SSC works the best. Now we can also
+do feature selection to see if that improves MCC and other performance measures.
+
+First we need the feature importance as per the gini index. Also interesting to
+check out and scroll through it so we make a df of the "ranking".
+
+```{r}
+imp <- as.data.frame(ranger::importance(rfModels[["rfModel_AAC_DC_SSC.rds"]][["finalModel"]]))
+colnames(imp) <- "Gini"
+```
+
+Now with this feature importance index we can choose "cut off" points. For example
+we can only use features with a gini index importance greater than 8 or 4 etc.
+We will do this for three cut offs to see if this has an effect on performance.
+
+```{r}
+for (cutoff in c(4,6,8)){
+tgrid <- expand.grid(.mtry = 3:25, .splitrule = "gini", .min.node.size = 1:9)
+tgrid <- tgrid[sample(nrow(tgrid), 0.5 * nrow(tgrid)),]
+features <- c("Hemolytic", rownames(imp)[which(imp > cutoff)])
+modelRF <- train(Hemolytic  ~ ., data = RF_train[,features],
+                        method = "ranger",
+                        trControl = trainControl(method="cv", number = 10,
+                                                 classProbs = TRUE,
+                                                 summaryFunction = MySummary
+                        ), #10-fold cv
+                        tuneGrid = tgrid,
+                        num.trees = 2000,
+                        importance = "impurity",
+                        weights = train_weights)
+fileName <-
+  paste0(
+    "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModelsFeatureSelection/rfModel_AAC_DC_SSC_cutoff",
+    cutoff,
+    ".rds"
+  )
+saveRDS(modelRF, filename)
+rm(modelRF)
+}
+```
+
+Get the results of the above runs
+
+```{r}
+# List out rfModels from above
+rfModels <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModelsFeatureSelection/",
+    pattern = "cutoff",
+    full.names = T
+  )
+# Read in the .rds files
+rfModels <- lapply(rfModels, function(x) readRDS(x))
+# Set names to something sensisble
+names(rfModels) <-
+  list.files(
+    "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/rfModelsFeatureSelection/",
+    pattern = "cutoff",
+    full.names = F
+  )
+
+# Get results in a nice table. Find model with the highest MCC
+# First get a list with for each model the performance measures for the best 
+# performing model as per the MCC. 
+resultsList <- lapply(1:length(rfModels), function(i){
+  # Which one has highstest MCC?
+  best <- which(max(rfModels[[i]][["results"]][["mcc"]]) == rfModels[[i]][["results"]][["mcc"]])
+  # Find performance measures for this best performing model
+  df <- t(data.frame(c(
+    # Features used
+    names(rfModels[i]),
+    # Performance measures
+    rfModels[[i]][["results"]][["mcc"]][best], 
+    rfModels[[i]][["results"]][["mccSD"]][best],
+    rfModels[[i]][["results"]][["Sens"]][best],
+    rfModels[[i]][["results"]][["SensSD"]][best],
+    rfModels[[i]][["results"]][["Spec"]][best],
+    rfModels[[i]][["results"]][["SpecSD"]][best],
+    rfModels[[i]][["results"]][["Accuracy"]][best],
+    rfModels[[i]][["results"]][["AccuracySD"]][best],
+    # Which hyperparameters gave these rfModels?
+    rfModels[[i]][["results"]][["mtry"]][best],
+    rfModels[[i]][["results"]][["min.node.size"]][best]
+    )))
+  rownames(df) <- NULL
+  return(df)
+})
+# Get resuls into a df
+resultsDfCutoffs <-
+  data.frame(matrix(
+    unlist(resultsList),
+    nrow = length(resultsList),
+    byrow = T
+  ), stringsAsFactors = FALSE)
+
+# Add colnames
+colnames(resultsDfCutoffs) <- c("Features", "MCC", "MCC_SD", "Sens", "SensSD", "Spec", "SpecSD", "Acc", "AccSD", "Mtry", "min.node.size") 
+resultsDfCutoffs
+```
+
+Now let's visualise the results
+
+```{r}
+# Bind the df's with results together
+resultsDfAll <- rbind(resultsDf[,1:9], resultsDfCutoffs[,1:9])
+# Change names and levels of the factor to something more human readable
+resultsDfAll$Features <- factor(c("AAC, DC, SSC", "AAC, DC", "AAC, SSC", "AAC", "DC, SSC", "DC", "AAC, DC, SSC, cutoff 4", "AAC, DC, SSC, cutoff 6", "AAC, DC, SSC, cutoff 8"), levels = c("AAC", "AAC, SSC", "DC", "DC, SSC", "AAC, DC", "AAC, DC, SSC", "AAC, DC, SSC, cutoff 4", "AAC, DC, SSC, cutoff 6", "AAC, DC, SSC, cutoff 8"))
+# Also switch the order around for our graph
+resultsDfAll <- resultsDfAll[c(4,3,6,5,2,1,7,8,9),]
+# "Melt" the df so ggplot can use it
+resultsDfAll <- melt(resultsDfAll, id.vars = "Features")
+# Split SD and values
+# Which rows have SD?
+sdRows <- grep(pattern = "SD", resultsDfAll[,2])
+# Cbind the split sets
+resultsDfAll <- cbind(resultsDfAll[-sdRows,], resultsDfAll[sdRows, 2:3])
+# Values need to be numeric obviously
+resultsDfAll[,c(3)] <- as.numeric(resultsDfAll[,c(3)])
+resultsDfAll[,c(5)] <- as.numeric(resultsDfAll[,c(5)])
+# Change names to something sensible
+names(resultsDfAll) <- c("Features", "Variable", "Value", "SD_Variable", "SD")
+```
+
+And plot 
+```{r}
+# Plot
+p1 <- ggplot(resultsDfAll,
+       aes(
+         x = Features,
+         ymin = Value - SD,
+         ymax = Value + SD,
+         fill = Variable
+       )) +
+  geom_bar(
+    aes(y = Value),
+    colour = "black",
+    position = "dodge",
+    stat = "identity",
+    width = 0.9
+  ) +
+  scale_y_continuous(name = "Value", limits = 0:1) +
+  geom_errorbar(width = .2,
+                colour = "black",
+                position = position_dodge(width = 0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    )
+  ) + scale_fill_jco()
+p1
+```
+
+Now it is hard to compare between features, if we change the grouping around it gets easier to compare between
+features but looks less pretty. 
+
+```{r}
+# Plot, x is changed around with fill here to switch grouping
+p2 <- ggplot(resultsDfAll, aes(x = Variable, ymin=Value-SD, ymax=Value+SD, fill = Features)) +   
+  geom_bar(aes(y = Value), colour = "black", position = "dodge", stat="identity", width=0.9) + 
+  scale_y_continuous(name="Value", limits= 0:1) +
+  geom_errorbar(width=.2, colour = "black", position = position_dodge(width=0.9)) +
+  ggtitle("Performance measures 10-fold CV Random Forest") +
+  theme_minimal() +  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+ scale_fill_jco() 
+p2
+```
+
+We can also plot the feature importance according to gini index. A higher gini score
+means that when splitting the random forst tree on this feature allows for a 
+better devide in (this case) hemolytic and non hemolytic peptides. 
+Features with high gini values are thus good features for the algorithm to 
+predict for novel peptides their hemolytic activity
+
+```{r}
+# Sort out importance index from high to low
+imp <- imp %>% arrange(desc(Gini))
+# Take top 30
+imp_30 <- slice(imp, 1:30)
+# Add rownames as column for ggplot
+imp_30$features <- rownames(imp_30)
+# Plot
+ggplot(imp_30, aes(x=reorder(features, Gini), y=Gini)) + 
+  geom_point() + geom_segment(aes(x=features,xend=features,y=0,yend=Gini), colour = "grey50") + coord_flip() + theme_minimal() + xlab("Features") + ylab("Mean decrease of the Gini index") + ggtitle("Top 30 features with highest mean decrease of the Gini index") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Finally, the best model. This is the combination of all features with no cut off
+with mtry 23 and min.node.size 1. This model was chosen based on MCC, but all the
+performance measures included were the highest for this variant.
+
+```{r}
+# Train model on full training set with the best found features and hyperparameters
+bestRFModel <- ranger(Hemolytic  ~ ., data = RF_train, num.trees = 2000, min.node.size = 1, mtry = 23, case.weights = train_weights)
+# Store model so we can reference to this exact model and reuse it
+saveRDS(bestRFModel, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/finalModel/bestRFModel.rds")
+bestRFModel <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/finalModel/bestRFModel.rds")
+# Predict for the test set
+pred <- predict(bestRFModel, RF_test)
+
+  # List to store performance measures so we can save them
+  testSetPerformance <- list()
+  # Confusion matrix
+  testSetPerformance <-
+    confusionMatrix(as.factor(pred$predictions),
+                    as.factor(RF_test$Hemolytic),
+                    positive = "X1")
+  testSetPerformance
+  # MCC
+  cat("\nMCC: ")
+  testSetPerformance$MCC <-
+    mlr3measures::mcc(as.factor(RF_test$Hemolytic),
+                      as.factor(pred$predictions),
+                      positive = "X1")
+  testSetPerformance$MCC
+  
+  # And we find which sequences were correctly and wrongly predicted
+  # Add hemo info and prediction results to test sequences we saved at the start
+  RF_test_sequences <- data.frame(RF_test_sequences, as.character(RF_test$Hemolytic))
+  colnames(RF_test_sequences) <- c("Sequences", "Hemolytic")
+  # Add the predicted class
+  RF_test_sequences$Prediction <- as.character(pred$predictions)
+  # Add if prediction was correct or incorrect
+  RF_test_sequences$PredictionCorrect <- "Incorrect"
+  RF_test_sequences[RF_test_sequences$Hemolytic == RF_test_sequences$Prediction,4] <- "Correct"
+  # Store in list
+  testSetPerformance$predictionResults <- RF_test_sequences
+  # Store performance
+  saveRDS(testSetPerformance, "/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_testSetPerformance.rds")
+```

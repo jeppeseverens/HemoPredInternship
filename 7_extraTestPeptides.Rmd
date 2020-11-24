@@ -1,0 +1,186 @@
+```{r}
+library(ranger)
+library(caret)
+library(dplyr)
+library(stringr)
+library(parallel)
+library(foreach)
+library(protr)
+library(doParallel)
+```
+
+Here we will test our RF + peptide composition model on some extra peptides
+I extracted from the internet and cross reverenced with the hemo dataset to see
+if they werent in there. I also took intrachainbond and N/C-term mod info from 
+the papers these peptides were in and put them in the hemo or non hemo class
+based on the system used by HAPPENN.
+
+Import the peptides
+```{r}
+extraTest <-read.csv("file:///home/jeppe/Dropbox/internship_TNO/Datasets/Extra_test/extraTest.csv")
+```
+
+I already predicted the Secondary structure, we can extract it and bind it
+
+```{r}
+# List the files with secondary strcuture information
+SS3_files <- list.files(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/extraTest_ss3/", pattern = ".+ss3", full.names = TRUE)
+
+# Lets build a function to extract secondary strcuture info 
+# input is vector of .ss3 file (ourput from Porter5) locations
+extractSS3 <- function(files){ 
+
+# Need this to dissect .ss3 file; C coil, H helix, E sheet
+ss3Structures <- c("C", "H", "E") 
+
+# For each file in the files list
+ss3 <- foreach(file = files, .combine = rbind) %do% {
+# Read porter 5 output as table  
+ss3Output <- read.table(file = file, header = F)
+# Take sequences, which are column 2, transpose and make vector and collapse
+ss3Sequence <- paste(as.vector(t(ss3Output[2])), collapse = "") 
+# Take secondary structure info, which are column 3, transpose and make vector 
+# and collapse
+ss3Results <- as.vector(t(ss3Output[3])) #takes results
+# The summary function is used to quickly get the amount of occurances of the 
+# three classes for each sequence, then this is devided by the sequence length 
+# to get the percentage of occurance. It is then stored as a df with three columns
+ss3 <- t(as.data.frame(x = summary(factor(ss3Results, levels = ss3Structures), maxsum = 4)/length(ss3Results), row.names = c("Coil", "Helix", "Sheet"))) 
+ss3 <- as.data.frame(ss3)
+# Convenient to have the sequence
+rownames(ss3) <- ss3Sequence 
+# And the secondary structure in sequence format
+ss3$SS <- paste(ss3Results, collapse = "")
+return(ss3)}
+
+as.data.frame(ss3)
+}
+# Run our function 
+SS3 <- extractSS3(SS3_files)
+```
+
+Bind ssc info
+
+```{r}
+SS3$Sequence <- rownames(SS3) 
+
+l_temp <- length(extraTest$Sequence) #to check if you have all SS3 and see if you lose rows with merge
+extraTest <-
+    merge(extraTest, SS3[,c(1:3,5)], by = "Sequence") #merge, don't include the full secondary structure sequence
+l_temp_2 <-
+    length(extraTest$Sequence)
+cat("This should be true, if it is not you miss ss3 data:  ")
+!(l_temp_2 < l_temp)
+```
+
+Add AAC and DC info
+```{r}
+# Frequency of 20 single aminoacids
+AAC <- as.data.frame(t(sapply(as.vector(extraTest$Sequence), extractAAC))) 
+# Frequency of 20*20 = 400 aminoacid combinations
+DC <- as.data.frame(t(sapply(as.vector(extraTest$Sequence), extractDC)))
+
+# Combine
+extraTest <- cbind(extraTest, AAC, DC)
+```
+
+Load best model, modify df a bit
+
+```{r}
+# Load model we determined was the best
+bestRFModel <- readRDS("/home/jeppe/Dropbox/internship_TNO/R/2_RF/RF_models/finalModel/bestRFModel.rds")
+
+# Modify df a bit
+colnames(extraTest)[colnames(extraTest) == 'NA'] <- "NA." 
+# STore and remove sequences
+extraTestSequences <-extraTest$Sequence
+extraTest$Sequence <- NULL
+# And our y column has to contain factors for the random forest library to work
+extraTest$Hemolytic <- as.factor(make.names(factor(extraTest$Hemolytic)))
+extraTest <- extraTest %>% mutate_if(is.character, as.factor) 
+# Set correct order for positive and negative in performance measuers
+extraTest$Hemolytic <-factor(extraTest$Hemolytic, levels = rev(levels(extraTest$Hemolytic)))
+```
+
+Predict and get performance measures, bind sequences
+
+```{r}
+pred <- predict(bestRFModel, extraTest)
+confusionMatrix(as.factor(pred$predictions),
+                    as.factor(extraTest$Hemolytic),
+                    positive = "X1")
+
+pred1 <- data.frame("Predictions" = pred$predictions, "Sequence" = extraTestSequences)
+```
+
+Compare to predictions of HAPPENN 
+https://research.timmons.eu/
+and HemoPred http://codes.bio/hemopred/
+
+```{r}
+# Import their predictions
+predHAPPENN <- read.csv("file:///home/jeppe/Dropbox/internship_TNO/R/7_extraTestPeptides/happennExtraTestPredictions.csv", header = F)
+predHemoPred <- read.csv("file:///home/jeppe/Dropbox/internship_TNO/R/7_extraTestPeptides/HLPpred-FuseExtraTestPredictions.csv", header = F)[1:2]
+
+# Add colnames
+colnames(predHAPPENN) <- c("Sequence", "predHAPPENN")
+colnames(predHemoPred) <- c("Sequence", "predHLPpred-Fuse")
+
+# Join
+pred2 <- inner_join(predHAPPENN, predHemoPred, by = "Sequence")
+```
+
+Make df so we can easily compare
+
+```{r}
+# Join predictions
+df <- inner_join(pred1, pred2)
+# Add truth and names 
+truthNames <-read.csv("file:///home/jeppe/Dropbox/internship_TNO/Datasets/Extra_test/extraTest.csv")
+truthNames <- truthNames[c(1:2,6)]
+# make class names same
+truthNames$Hemolytic <- ifelse(truthNames$Hemolytic == 1, "X1", "X0")
+
+df <- inner_join(truthNames, df)
+
+write.csv(df, "/home/jeppe/Dropbox/internship_TNO/R/7_extraTestPeptides/predictionResultsExtraTest.csv")
+```
+
+One last thing, what if we use all peptides to train a RF and classify the extra
+test case?
+
+```{r}
+hemo_df <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/Hemo_databases/hemo_df_ICB_NCtermMods_SS3_AAC_DC_18july.csv")
+# Remove some columns that we dont need
+hemo_df$X <- NULL
+hemo_df$Source <- NULL
+hemo_df$Sequence <- NULL
+
+# Edit the colnames of the NA dipeptide, Ranger does not like this.
+colnames(hemo_df)[colnames(hemo_df) == 'NA'] <- "NA." 
+# And our y column has to contain factors for the random forest library to work
+hemo_df$Hemolytic <- as.factor(make.names(factor(hemo_df$Hemolytic)))
+hemo_df <- hemo_df %>% mutate_if(is.character, as.factor) 
+# Set correct order for positive and negative in performance measuers
+hemo_df$Hemolytic <-factor(hemo_df$Hemolytic, levels = rev(levels(hemo_df$Hemolytic))) 
+
+# Weights
+train_weights <- ifelse(hemo_df$Hemolytic == "X1",
+                        (1/table(hemo_df$Hemolytic)[1]) * 0.5,
+                        (1/table(hemo_df$Hemolytic)[2]) * 0.5)
+# Train rf
+bestRFModel <- ranger(Hemolytic  ~ ., data = hemo_df, num.trees = 2000, min.node.size = 1, mtry = 23, case.weights = train_weights)
+
+predFullDataset <- predict(bestRFModel, extraTest)
+confusionMatrix(as.factor(predFullDataset$predictions),
+                    as.factor(extraTest$Hemolytic),
+                    positive = "X1")
+# STore in df
+predFullDataset <- data.frame("PredictionsFullDS" = pred$predictions, "Sequence" = extraTestSequences)
+
+# bind to compare between rf on train and rf on full
+df <- inner_join(df, predFullDataset)
+
+# predictions are the same
+```
+

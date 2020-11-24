@@ -1,0 +1,313 @@
+
+```{r}
+library(protr)
+library(stringr)
+library(parallel)
+library(doParallel)
+library(pbmcapply)
+library(data.table)
+library(sigmoid)
+library(stringr)
+library(dplyr)
+```
+
+# Secondary structure prediction and feature calculations 
+First we will predict the secondary structure of our peptides with Porter5.
+Furthermore we will will extracts several features we can use as inputs for 
+machine learning models
+
+First let us just load in our dataframe with hemolytic and non-hemolytic peptides
+
+```{r}
+dataset <- read.csv("/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/expHemoNonhemoPeps.csv")
+dataset$X <- NULL
+```
+
+## Secondary structure prediction
+We will use Porter5 for secondary structure prediction: Porter5 works by running 
+your sequence through a neural network and predicts the secondary structure in 
+three classes (Coil, Helix, Sheet) per amino acid position
+
+First we need to run Porter 5 of the fasta file with all the sequences of the 
+above dataset. See https://github.com/mircare/Porter5 for how to set up Porter 5 
+yourself. You only need the first 4 requirments, not the optional PsiBlast and 
+Uniref90 files. Porter5 is run through the command line, I use linux. I have no 
+idea if the following two blocks of code will work on windows. The first time 
+you run this, run it in a command shell not here. You will need to supply some 
+standard setting, make sure to supply the full path to hhblits or else it won't 
+work from the bash shell here. If you run it in a command shell instead of here,
+it will be fine to supply the path you use for hhblits in the command shell when
+setting it up (which is probably just "hhblits").
+
+If you want to skip running Porter5 scroll down I have the results saved also
+
+We first split out fasta files in a fasta file per sequence, luckily Porter5 
+has an inbuild command for that. 
+
+Dont forget to set up your own file locations
+
+```{bash}
+cd /home/jeppe
+python3 Porter5/split_fasta.py /home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/fastas/sequences.fasta
+```
+
+We have our individual fasta files per sequence, now we just run Porter5 on it. 
+This takes ~20 seconds per 2 sequences on my laptop. 2800 * 1/2 * 20 / 60 / 60 = 8 hours. 
+
+!!! Make sure to change the CPU settings (amount of cores) and parallel 
+(sequences to do at the same time) I have 8 cores so I now dedicate 4 cores per 
+sequence and do two at the same time with this setup.
+
+Dont forget to set up your own file locations
+
+```{bash}
+cd /home/jeppe
+python3 Porter5/multiple_fasta.py -i Fastas/ --cpu 4 --parallel 2 --fast
+```
+  
+From here we will extract the Secondary structure info from the Porter5 output. 
+We will extract both the occurance frequency of each of the three classes devided 
+by the sequence length and just the secondary structure as class per position in 
+the peptide. As an example: 
+peptide sequence: 'ARWP' 
+SS sequence:      'CCHE' (C coil, H helix, E sheet)
+
+```{r}
+# List the files with secondary strcuture information
+SS3_files <- list.files(path = "/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/ss3Raw/", pattern = ".+ss3", full.names = TRUE)
+
+# Lets build a function to extract secondary strcuture info 
+# input is vector of .ss3 file (ourput from Porter5) locations
+extractSS3 <- function(files){ 
+
+# Need this to dissect .ss3 file; C coil, H helix, E sheet
+ss3Structures <- c("C", "H", "E") 
+
+# For each file in the files list
+ss3 <- foreach(file = files, .combine = rbind) %do% {
+# Read porter 5 output as table  
+ss3Output <- read.table(file = file, header = F)
+# Take sequences, which are column 2, transpose and make vector and collapse
+ss3Sequence <- paste(as.vector(t(ss3Output[2])), collapse = "") 
+# Take secondary structure info, which are column 3, transpose and make vector 
+# and collapse
+ss3Results <- as.vector(t(ss3Output[3])) #takes results
+# The summary function is used to quickly get the amount of occurances of the 
+# three classes for each sequence, then this is devided by the sequence length 
+# to get the percentage of occurance. It is then stored as a df with three columns
+ss3 <- t(as.data.frame(x = summary(factor(ss3Results, levels = ss3Structures), maxsum = 4)/length(ss3Results), row.names = c("Coil", "Helix", "Sheet"))) 
+ss3 <- as.data.frame(ss3)
+# Convenient to have the sequence
+rownames(ss3) <- ss3Sequence 
+# And the secondary structure in sequence format
+ss3$SS <- paste(ss3Results, collapse = "")
+return(ss3)}
+
+as.data.frame(ss3)
+}
+# Run our function in paralell
+cl <- makePSOCKcluster(7)
+registerDoParallel(cl)
+SS3 <- extractSS3(SS3_files)
+stopCluster(cl)
+
+# Store results
+write.csv(SS3, file = "/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/ss3Df.csv")
+```
+
+Load it back in if you do not want to run chuncks above
+```{r}
+SS3 <- read.csv(file = "/home/jeppe/Dropbox/internship_TNO/Datasets/SS3/ss3Df.csv", row.names = 1)
+# Storing as rownames was maybe not the cleanest idea
+SS3$Sequence <- rownames(SS3) 
+```
+
+## Feature extraction
+Now that we have our secondary strcutures we can start with feature extractions.
+For the SVM and Random forest I am planning to use the amino acid composition (AAC),
+dipeptide composition (DC) and my own made up secondary structure composition (SSC)
+as inputs. We already have the SSC, so we only need to do the AAC and DC still.
+
+Let's first bind the SSC to our dataset of hemolytic/nonhemolytic peptides
+
+```{r}
+dataset_SS3_AAC_DC <- dataset
+
+l_temp <- length(dataset_SS3_AAC_DC$Sequence) #to check if you have all SS3 and see if you lose rows with merge
+dataset_SS3_AAC_DC <-
+    merge(dataset_SS3_AAC_DC, SS3[,c(1:3,5)], by = "Sequence") #merge, don't include the full secondary structure sequence
+l_temp_2 <-
+    length(dataset_SS3_AAC_DC$Sequence)
+cat("Did we find all ss3 data:  ")
+!(l_temp_2 < l_temp)
+```
+
+Now we will take both the amino acid composistion 
+AAC = occurancy of the 20 aminoacids/length sequence
+and the dipeptide composition 
+DC = occurancy of the 20*20 = 400 aminoacid combinations/(length sequence-1) 
+from the peptides sequences. We use the Protr library for this.
+
+```{r}
+# Frequency of 20 single aminoacids
+AAC <- as.data.frame(t(sapply(as.vector(dataset_SS3_AAC_DC$Sequence), extractAAC))) 
+# Frequency of 20*20 = 400 aminoacid combinations
+DC <- as.data.frame(t(sapply(as.vector(dataset_SS3_AAC_DC$Sequence), extractDC)))
+# Bind to the ss3 info we already have
+dataset_SS3_AAC_DC <- cbind(dataset_SS3_AAC_DC, AAC, DC) 
+
+# And store
+write.csv(dataset_SS3_AAC_DC, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/datasetPeptideCompositionFeatures.csv")
+```
+
+We now have our df with our sequences, hymolytic class, intrachainbonds, 
+N/C-term mods, AAC, DC and SS3 info. This will be used for the RF and SVM.
+
+## One hot encoding of amino acids and secondary structure
+Now we will do the one hot encoding of the amino acids sequence and the 
+secondary structure to be used as inputs for the convolutional neural network. 
+
+First for the sequences
+
+```{r}
+# Sort our dataset by sequence, we will do this later for the SS dataset also
+# so that it is easier to combine the one hot encodings
+dataset <- dataset %>% arrange(Sequence)
+
+# Input is our database dataset
+# Output is our sequences in a list in a matrix of onehot encoded format
+dfToOnehotmatrix <- function(dataset){
+#Store sequences and hemo info
+sequences <- as.vector(dataset$Sequence) 
+hemolytic <- as.vector(dataset$Hemolytic)
+
+# Amino acid dictionary
+AAdict = c('A','C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y') 
+AAencode = 1:20
+# Amino acids are numerical encoded now, we need this to go to one hot encoding easier
+names(AAencode) <- AAdict 
+
+sequenceToOnehotmatrix <- function(sequence) { 
+  #First we split the sequence in seperate elements of a vector
+  split_sequence <- str_split(sequence, pattern = "")[[1]]
+  sequence_encoded <- c() #create empty vector to work with
+  
+  # We now enter the amino acid in AAencode, we recieve the numerber associated 
+  # with this amino acid, and we append this to the empty vector. We do this for 
+  # each amino acid in the sequence and we now have a numerical encoding for our 
+  # sequence. For example: 'ARKN' -> 3718
+  for(n in 1:length(split_sequence)){
+    sequence_encoded <-
+      append(sequence_encoded, AAencode[split_sequence[n]]) 
+    
+  }
+  # We now create an empty matric with 20 rows (20 amino acids) and collums 
+  # according to the length of the longest sequence in the dataframe, in our case 
+  # this is 133 amino acids.
+  onehot_matrix <- matrix(nrow = 20, ncol = max(str_length(sequences)), dimnames = list(AAdict) ) 
+  # Now we go through our empty matrix and for each column we add a 1 in the row corresponding to out amino acid. 
+  for (n in 1:length(sequence_encoded)) {
+  onehot_matrix[sequence_encoded[n], n] <- 1
+  }
+  # The rest we just put in zero, and it is automatically zero padded.
+  onehot_matrix[is.na(onehot_matrix)] <- 0 
+  # Add sequence for merging
+  onehot_matrix <- list(sequence, onehot_matrix) 
+  return(onehot_matrix)
+}
+
+# Run function in parallel
+sequencesAsOnehotmatrices <- pbmclapply(sequences, sequenceToOnehotmatrix, mc.cores = 8) 
+
+# Add hemo info and name lists
+for(n in 1:length(hemolytic)){
+  sequencesAsOnehotmatrices[[n]][[3]] <- hemolytic[n]
+  names(sequencesAsOnehotmatrices[[n]]) <- c("Sequence", "Sequence_1H", "Hemolytic") 
+} 
+return(sequencesAsOnehotmatrices)
+} 
+
+onehotSequencesHemo = dfToOnehotmatrix(dataset)
+```
+
+Now the same for the secondary structure:
+
+```{r}
+# Sort our dataset
+SS3 <- SS3 %>% arrange(Sequence)
+
+# Input is our ss3 dataframe with the secondary structure sequence and our dataset
+dfToOnehotmatricesSS3 <- function(SS3, dataset){
+
+# Store secondary structure
+ss3 <- as.vector(SS3$SS)
+# Store Sequence
+sequences_vector <- as.vector(dataset$Sequence)
+# Store hemo info
+hemolytic <- as.vector(dataset$Hemolytic)
+
+# Again we need a way to numerical encode our secondary structure, 
+# like with sequence
+SSdict = c('C','H', 'E')
+SSencode = 1:3
+names(SSencode) <- SSdict
+
+
+SS3ToOnehotmatrix <- function(sequence) {
+  # Split secondary structure element wise
+  split_sequence <- str_split(sequence, pattern = "")[[1]]
+  sequence_encoded <- c()
+  # Create numerical encoded sequence
+  for(n in 1:length(split_sequence)){
+    sequence_encoded <-
+      append(sequence_encoded, SSencode[split_sequence[n]])
+    
+  }
+  # Create empty matrix of correct dimensions
+  onehot_matrix <- matrix(nrow = 3, ncol = max(str_length(sequences_vector)), dimnames = list(SSdict) )
+  for (n in 1:length(sequence_encoded)) {
+    # Add ones per position for correct secondary structure class
+  onehot_matrix[sequence_encoded[n], n] <- 1
+  }
+  # Rest add zeroes to
+  onehot_matrix[is.na(onehot_matrix)] <- 0
+  # Add secondary structure as info
+  onehot_matrix <- list(sequence, onehot_matrix)
+  return(onehot_matrix)
+}
+
+SS3ToOnehotmatrix <- pbmclapply(ss3, SS3ToOnehotmatrix, mc.cores = 7)
+
+# Add hemo info, primary sequence and change names
+for(n in 1:length(hemolytic)){
+  SS3ToOnehotmatrix[[n]][[3]] <- hemolytic[n]
+  SS3ToOnehotmatrix[[n]][[4]] <- sequences_vector[n]
+  names(SS3ToOnehotmatrix[[n]]) <- c("SS3_sequence", "SS3_sequence_1H", "Hemolytic", "Sequence")
+}
+return(SS3ToOnehotmatrix)
+}
+
+onehotSSHemo <- dfToOnehotmatricesSS3(SS3, dataset)
+```
+
+Merge the two one hot encodings. We will have per peptide a list with sequence
+1h encoded, secondary structure 1h encoded, sequence, secondary structure and hemo info
+
+```{r}
+# lapply/map function c to combine the lists
+onehotSequenceSSHemo <- Map(c, onehotSequencesHemo, onehotSSHemo) 
+
+# We remove the double information per list of list, i.e. hemolytic is double 
+# because it was available in both onehotSequencesHemo and onehotSSHemo
+onehotSequenceSSHemo <-
+  lapply(1:length(onehotSequenceSSHemo), function(x)
+    onehotSequenceSSHemo[[x]][!duplicated(onehotSequenceSSHemo[[x]])])
+
+# And store
+saveRDS(onehotSequenceSSHemo, "/home/jeppe/Dropbox/internship_TNO/Datasets/hemoDatabases/onehotSequenceandSS.rds")
+```
+
+We can now move on to analysis the features we have extracted and to start using 
+them as inputs for machine learning models.
+
+
